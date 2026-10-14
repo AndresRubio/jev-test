@@ -1,7 +1,7 @@
 # local-jev: design spec
 
 - **Date:** 2026-09-25
-- **Status:** Draft for review
+- **Status:** Approved 2026-10-14, amended the same day for laya-mlx 0.4.0 and MCP SDK 2.3.0 (§15)
 - **Owner:** Andres Rubio
 
 ## 1. Summary
@@ -27,7 +27,7 @@ It runs as one background process on `127.0.0.1`. It loads the model once, serve
     | Multilingual (`convaiinnovations/laya`, subfolder `multilingual`) | mmBERT-base | 322M | 1,024 tokens, up to 8,192 |
     | Typed decisions (subfolder `typed-decisions`) | ModernBERT-large | 421M | 1,024 tokens |
 
-- **laya-mlx is a native Apple Silicon port.** It is an independent port to MLX, version 0.2.0, Apache-2.0. Its own M3 Max measurements, 16-bit, for one short question:
+- **laya-mlx is a native Apple Silicon port.** It is an independent port to MLX, Apache-2.0. Version 0.4.0, released 2026-10-10, natively reports state truncation and collapsed options, returns `answer_confidence`, supports neutral `labels` on yes/no questions, and frees MLX memory on unload. Its own M3 Max measurements of version 0.2.0, 16-bit, for one short question:
   - English: 17.8 ms median, with a peak of 944 MiB.
   - Multilingual: 10.9 ms median, with a peak of 688 MiB.
   - Its answers match upstream Laya on 63 of 63 validation questions.
@@ -101,8 +101,11 @@ Each unit has one purpose and a narrow interface. The package is `local_jev` in 
 
 | Module | Purpose | Depends on |
 |---|---|---|
-| `config.py` | Load `~/.config/local-jev/config.toml`, apply `LOCAL_JEV_*` environment overrides, and supply defaults (§12). | none |
-| `schema.py` | Jev request and response models (pydantic), plus validation errors that include how to fix the request. | none |
+| `errors.py` | `ServiceError` (HTTP status, code, message, hint) and the engine and runtime exceptions that map onto it. | none |
+| `config.py` | Load `~/.config/local-jev/config.toml`, apply `LOCAL_JEV_*` environment overrides, and supply defaults (§12). | `errors` |
+| `schema.py` | Jev request validation (plain Python, no pydantic), with errors that include how to fix the request. | `errors` |
+| `checkpoints.py` | Pinned checkpoint table, download through `huggingface_hub`, and SHA-256 verification. | `huggingface-hub` |
+| `service.py` | `DecisionService`, shared by REST and MCP: parse, guard, run, finalize, log, batch orchestration, status. | everything below `api_*` |
 | `guard.py` | Changes applied before and after inference (§7). It is engine-agnostic, except for flags an engine declares. | `schema`, engine capabilities |
 | `engines/base.py` | The `Engine` protocol: `decide(state, questions, model) -> dict`, `embed(texts)`, `load()`, `unload()`, `status()`, `capabilities`. | none |
 | `engines/laya_mlx.py` | Wraps `laya_mlx.Router` (§8). Also handles truncation measurement, shortlisting, and retrying in 32-bit when outputs are not finite. | `laya-mlx` |
@@ -151,9 +154,10 @@ The response is a superset of Jev's.
   - `usage` reports `input_tokens`, and `output_tokens` is always 0.
 - **Local additions inside each answer:**
   - `answer_confidence`: the probability of the reported answer.
-  - `warnings`: a list of codes, empty when there are none.
+  - `warnings`: a list of strings, each starting with its code, for example `"state_truncated: 412 of 900 input tokens did not fit and were ignored; …"`. Empty when there are none.
   - `shortlisted`: present only when the options were narrowed.
-- **The top-level `local` block** holds `backend`, `checkpoint`, `latency_ms` and `warnings`.
+- **Fields not passed through:** Laya's `action` block, because its `act_probability` carries no usable signal. `usage` holds only Jev's two fields.
+- **The top-level `local` block** holds `backend`, `checkpoint`, `routing_reason`, `latency_ms` and `warnings`, each warning prefixed with its question id. It also holds `usage`, with Laya's extra diagnostics (`state_tokens`, `state_tokens_dropped`, `truncated`, `truncated_questions`, `options`), when present.
 
 ```json
 {
@@ -216,6 +220,7 @@ claude mcp add --transport http --scope user local-jev http://127.0.0.1:7711/mcp
   - A `choice` checks whether the chosen label equals the value.
   - A `score` compares the expected score.
 - **Limits:** at most 8 questions, 5,000 items, 20,000 question evaluations and 50 MB of file.
+- **Execution:** laya-mlx has no API for scoring several states in one forward pass, so each item is one model call. Items go to the inference worker in groups of 32, one job per group, so single `decide` requests can run between groups. If the 300 s deadline passes, the batch fails with a 504 that says how many items were done.
 - **The result contains:**
   - **`count`:** the number of items.
   - **`summary`:** for each question, either counts per label (`choice`); the count at or above 0.5 plus the mean P(true) (`noul`); or a histogram of the most likely level plus the mean score (`score`).
@@ -256,20 +261,21 @@ claude mcp add --transport http --scope user local-jev http://127.0.0.1:7711/mcp
    - `score` needs 2 to 10 levels, each with a non-empty description; upstream Laya rejects null levels.
    - Instructions may be a string, an object or an array. Objects and arrays are serialized to JSON.
 2. **The yes/no mode** is set by the `noul_mode` configuration option:
-   - `native` sends the question as a Laya `noul`.
-   - `ab_choice` sends it as a `choice` with the options `{"A": <true description, or "yes">, "B": <false description, or "no">}`, and returns `noul` = P(A). This is Laya's documented workaround for label bias.
+   - `native` sends the question as a Laya `noul`, with the default `false`/`true` option labels.
+   - `ab_labels` adds `"labels": {"true": "A", "false": "B"}` to every `noul` question that has no `labels` of its own. laya-mlx 0.4.0 shows these neutral labels to the model and still returns `noul` = P(true). This is Laya's documented workaround for label bias.
+   - Callers may always pass their own `labels`.
    - The default is set by the evaluation in §10.3: the mode with higher accuracy on the yes/no set wins, and a tie goes to `native`.
 3. **More than 20 options** are shortlisted to the top 20 with `laya_mlx.predict_shortlist` and `embed_fn_from_agent`. The answer gains `shortlisted: {"kept": [...], "dropped": n}`, and its probabilities cover only the kept labels.
 4. **Option-budget overflow.** When laya-mlx raises "too many options for the token budget", the service returns a 422 with the hint "shorten option descriptions or split into two questions".
-5. **Truncation detection.**
-   - For each question, the service compares the state's token count with the room left after the question prefix, using laya-mlx's own tokenizer and prefix builder.
-   - When the state was cut, it adds the warning `state_truncated`, with the tokens used and the total, and the hint "use decide_batch with format=chunks, or model=multilingual".
+5. **Truncation and collapsed options.** laya-mlx 0.4.0 reports both in `usage`:
+   - `truncated_questions` and the token counts become the warning `state_truncated` on each affected answer, with the hint "use decide_batch with format=chunks, or model=multilingual".
+   - `usage.options` becomes the warning `options_collapsed` when some options no longer had a distinct token span.
 6. **`answer_confidence`** gives every answer type one comparable number:
    - For `choice`, the probability of the chosen label.
    - For `score`, the probability of the most likely level.
    - For `noul`, the larger of p and 1 − p.
 
-   Laya's `confidence` field, which is 1 minus the normalized entropy, is passed through unchanged.
+   laya-mlx 0.4.0 returns this value itself; the guard computes it the same way for backends that do not. Laya's `confidence` field, which is 1 minus the normalized entropy, is passed through unchanged.
 7. **Non-finite outputs** get one retry on a 32-bit copy of the checkpoint, loaded lazily. If that also fails, the service returns a 503.
 8. **Remote backends** get rules 1 and 6 only. Laya-specific changes are skipped, because they depend on flags the engine declares.
 
@@ -281,8 +287,16 @@ claude mcp add --transport http --scope user local-jev http://127.0.0.1:7711/mcp
   - Typed decisions is the `typed-decisions` subfolder: 842 MB plus 3 MB. It loads only when a request asks for it by name.
   - laya-mlx downloads only the weight, configuration and tokenizer files, into the standard Hugging Face cache.
   - **Pinned revision: `c5d78730f3493e4fe16d61507ef4b78eef7318cf`.** This is the revision laya-mlx 0.2.0 validated its port against. The weight files it serves (SHA-256 prefixes: English `891102d37268`, multilingual `9d628fd971b7`, typed decisions `4fa56de72383`) are byte-identical to the latest revision (`55cf4c4…`, 2026-09-24) and to the separate `laya-multilingual` and `laya-typed-decisions` repositories that laya-mlx tested. The revision is stored in the configuration defaults. An integration test checks the downloaded weight hashes against these prefixes.
-- **Routing** uses `laya_mlx.Router(dtype="float16", max_loaded=2)`. It detects the language and script, and sends non-English text to the multilingual checkpoint. An explicit `model` always wins.
-- **Loading** happens on the first request; `local-jev pull` only downloads.
+- **Routing** uses `laya_mlx.Router(dtype="float16", max_loaded=2, default="english")`.
+  - The `models` mapping points at the pinned snapshot in the Hugging Face cache, because the Router itself cannot take a revision.
+  - It detects the language and script and sends non-English text to the multilingual checkpoint.
+  - `default="english"` keeps the pre-0.4.0 behaviour, in which input whose language cannot be decided (code, short commands) goes to the English checkpoint.
+  - An explicit `model` always wins.
+- **Downloads.**
+  - `local-jev serve` starts a background thread that downloads and verifies the English and multilingual checkpoints when they are missing. This is `laya.prefetch` in the configuration.
+  - A request that needs a checkpoint that is not ready yet gets a 503, `model_unavailable`, with a hint to retry, or to run `local-jev pull` (`--all` for typed decisions). It never hangs waiting for a download.
+  - Weight hashes are checked once per process.
+- **Loading** happens on the first request that needs a checkpoint. There is no preload option.
 - **Idle unload.** After `idle_unload_minutes` (default 15; 0 means never), the service calls `Router.unload()` and then `mx.clear_cache()`. The next request loads the model again.
 - **Worker.** One inference thread handles requests from a queue of up to 64. Engine calls run 16 questions per forward pass.
 - **Targets**, measured on this M1 Pro with 16 GB and reported in `docs/benchmarks.md`:
@@ -299,7 +313,7 @@ claude mcp add --transport http --scope user local-jev http://127.0.0.1:7711/mcp
 
 - **Binding.** The server binds to `127.0.0.1` only; there is no option to bind other addresses in v1.
 - **Host and Origin checks.** Middleware on every route rejects a Host that is not `127.0.0.1:<port>`, `localhost:<port>` or `[::1]:<port>`, with a 421. It rejects, with a 403, any Origin that is present and is not a loopback origin (`http://127.0.0.1`, `http://localhost` or `http://[::1]`, on any port). This includes `Origin: null`. The MCP SDK's own transport security is also configured with the same loopback allowlist.
-- **Optional bearer token** (`LOCAL_JEV_TOKEN`), checked on every route except `/health`. `connect` includes the header when a token is set.
+- **Optional bearer token** (`LOCAL_JEV_TOKEN`), checked on every route except `/health`. `connect` includes the header when a token is set. `install-agent` copies a set token into the plist's `EnvironmentVariables` and writes the plist with mode 600.
 - **File policy for `decide_batch`.**
   - The path must be absolute and resolve, after following symlinks, to a regular file under `batch.allowed_roots` (default: the home directory).
   - The file is at most 50 MB, is decoded as UTF-8 with replacement characters for bad bytes, and is opened read-only.
@@ -356,9 +370,10 @@ claude mcp add --transport http --scope user local-jev http://127.0.0.1:7711/mcp
 
 - **Python 3.12**, managed with uv. The package is `local_jev` in a `src/` layout, installed with `uv tool install .` so `local-jev` is on the PATH.
 - **Pinned dependencies:**
-  - `laya-mlx==0.2.0`, released 2026-09-22.
-  - `mcp==2.2.0`, the Python SDK v2 (`from mcp.server import MCPServer`), released 2026-09-07.
-  - `uvicorn`, `starlette`, `httpx`, `pydantic`.
+  - `laya-mlx==0.4.0`, released 2026-10-10.
+  - `mcp==2.3.0`, the Python SDK v2 (`from mcp.server import MCPServer`), released 2026-10-02.
+  - `uvicorn`, `starlette`, `huggingface-hub`, `tokenizers`.
+  - `httpx2`, the maintained successor of httpx. The MCP SDK already depends on it, and Starlette's test client prefers it.
   - Development only: `pytest`, `ruff`.
 - **Configuration defaults** in `~/.config/local-jev/config.toml`:
 
@@ -366,13 +381,13 @@ claude mcp add --transport http --scope user local-jev http://127.0.0.1:7711/mcp
   port = 7711
   backend = "laya-mlx"           # or "remote"
   idle_unload_minutes = 15
-  noul_mode = "native"           # final default set by §10.3
+  noul_mode = "native"           # "native" or "ab_labels"; final default set by §10.3
   log_inputs = false
 
   [laya]
   revision = "c5d78730f3493e4fe16d61507ef4b78eef7318cf"
   dtype = "float16"
-  preload = []                    # checkpoints to load at start; empty = lazy
+  prefetch = ["english", "multilingual"]   # downloaded and verified in the background at serve start
 
   [batch]
   allowed_roots = ["~"]
@@ -410,3 +425,20 @@ claude mcp add --transport http --scope user local-jev http://127.0.0.1:7711/mcp
 - **Trained heads:** decision heads trained on the model's own embeddings, from the user's labelled examples.
 - **Apple Neural Engine:** use it through laya-apple.
 - **Kev in-process:** add Kev as an in-process engine.
+
+## 15. Amendments (2026-10-14)
+
+New releases appeared between drafting and approval. The plan follows these changes, which are already applied in the sections above:
+
+| What changed | Why |
+|---|---|
+| `laya-mlx` pin 0.2.0 → 0.4.0 | It natively reports truncation and collapsed options, returns `answer_confidence`, supports neutral yes/no `labels`, and frees MLX memory on unload. That removes custom guard code. Its 0.4.0 validation reports 378/378 answer agreement with upstream. |
+| `mcp` pin 2.2.0 → 2.3.0 | Fixes only; it adds the in-process `Client(server)` that the tests use. |
+| `Router(default="english")` | laya-mlx 0.4.0 changed the default for input whose language cannot be decided to the multilingual checkpoint. This keeps the routing this spec describes. |
+| `noul_mode` values `native` / `ab_labels` (was `ab_choice`) | Neutral labels are now native; no rewrite into a choice question is needed. |
+| Background prefetch at `serve` start; 503 while downloading; no `preload` option | A first request must not hang on an 845 MB download. |
+| Model revision stays `c5d7873…` | The newer Hugging Face revision `7b928d8…` (2026-10-03) has byte-identical weights, configurations and tokenizers. |
+| `decide_batch` runs one model call per item, in groups of 32 | laya-mlx has no multi-state batching API. |
+| New modules `errors.py`, `checkpoints.py`, `service.py` | Clearer unit boundaries. REST and MCP share one service. |
+| `warnings` are strings that start with a code; `usage` holds only Jev's fields; Laya's `action` is dropped | Jev compatibility, and readable messages for agents. |
+| `httpx2` instead of `httpx` | It is already a dependency of the MCP SDK, and Starlette's test client prefers it. |
