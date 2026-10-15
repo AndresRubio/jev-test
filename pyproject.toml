@@ -1,0 +1,41 @@
+[project]
+name = "local-jev"
+version = "0.1.0"
+description = "Local, open-weight Jev-style typed decisions (Laya on MLX) over MCP, a Jev-compatible REST API and a CLI"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "laya-mlx==0.4.0",
+    "mcp==2.3.0",
+    "huggingface-hub>=0.34,<2",
+    "tokenizers>=0.21,<1",
+    "httpx2>=2.10",
+    "starlette>=0.48",
+    "uvicorn>=0.31",
+]
+
+[project.scripts]
+local-jev = "local_jev.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8.3", "ruff>=0.12"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/local_jev"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-m 'not integration'"
+markers = ["integration: needs the real Laya weights (about 1.5 GB, downloaded on first run)"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+ignore = ["E501"]
