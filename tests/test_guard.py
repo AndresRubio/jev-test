@@ -4,6 +4,7 @@ from local_jev.engines.base import EngineResult
 from local_jev.errors import ModelUnavailable
 from local_jev.guard import (
     AB_LABELS,
+    BACKEND_HINT,
     answer_confidence,
     compact_answers,
     finalize,
@@ -179,3 +180,279 @@ def test_compact_answers():
     assert compact["dept"] == {"choice": "billing", "answer_confidence": 0.8}
     assert compact["refund"] == {"noul": 0.9, "answer_confidence": 0.9}
     assert set(compact["urgency"]) == {"score", "answer_confidence"}
+
+
+NAN = float("nan")
+INF = float("inf")
+CHOICE_PROBABILITIES = {"billing": 0.8, "tech": 0.2}
+SCORE_PROBABILITIES = {"0": 0.15, "1": 0.15, "2": 0.7}
+
+
+def from_backend(answers, questions, usage=None):
+    result = EngineResult(answers=answers, usage=usage or {}, model="remote")
+    return finalize(result, questions, backend="remote", latency_ms=1.0)
+
+
+def test_an_answer_without_a_type_takes_the_questions_type_and_a_computed_confidence():
+    answers = {
+        "refund": {"noul": 0.25, "confidence": 0.4},
+        "dept": {"choice": "tech", "probabilities": {"billing": 0.3, "tech": 0.7}},
+    }
+    questions = {"refund": QUESTIONS["refund"], "dept": QUESTIONS["dept"]}
+    response = from_backend(answers, questions)
+    assert response["answers"]["refund"] == {
+        "type": "noul",
+        "noul": 0.25,
+        "confidence": 0.4,
+        "answer_confidence": 0.75,
+        "warnings": [],
+    }
+    assert response["answers"]["dept"]["type"] == "choice"
+    assert response["answers"]["dept"]["answer_confidence"] == 0.7
+
+
+def test_a_choice_answer_without_probabilities_is_model_unavailable():
+    answers = {"dept": {"type": "choice", "choice": "billing", "confidence": 0.3}}
+    with pytest.raises(ModelUnavailable, match="'dept' is missing 'probabilities'") as caught:
+        from_backend(answers, {"dept": QUESTIONS["dept"]})
+    assert caught.value.hint == BACKEND_HINT
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        pytest.param({"type": "choice", "choice": "a", "confidence": 0.3}, id="no probabilities"),
+        pytest.param(
+            {"type": "score", "score": 1.0, "probabilities": {}, "confidence": 0.3},
+            id="empty probabilities",
+        ),
+        pytest.param({}, id="nothing to go on"),
+    ],
+)
+def test_answer_confidence_never_borrows_the_entropy_confidence(answer):
+    with pytest.raises(ModelUnavailable) as caught:
+        answer_confidence(answer)
+    assert caught.value.hint == BACKEND_HINT
+
+
+MALFORMED_ANSWERS = [
+    # not an answer
+    pytest.param("refund", None, "no answer for question 'refund'", id="null"),
+    pytest.param("refund", "yes", "'refund' that is not an object", id="text"),
+    pytest.param("refund", [0.9], "'refund' that is not an object", id="list"),
+    # a type that does not fit
+    pytest.param("refund", {"type": ["noul"], "noul": 0.9}, "unknown answer type", id="list type"),
+    pytest.param(
+        "refund", {"type": "maybe", "noul": 0.9}, "unknown answer type 'maybe'", id="unknown type"
+    ),
+    pytest.param(
+        "refund",
+        {"type": "choice", "choice": "billing", "probabilities": CHOICE_PROBABILITIES},
+        "'choice' answer for 'refund', which is a 'noul' question",
+        id="choice answer to a noul question",
+    ),
+    pytest.param(
+        "dept",
+        {"type": "score", "score": 1.0, "probabilities": SCORE_PROBABILITIES},
+        "'score' answer for 'dept', which is a 'choice' question",
+        id="score answer to a choice question",
+    ),
+    pytest.param(
+        "urgency",
+        {"type": "noul", "noul": 0.9},
+        "'noul' answer for 'urgency', which is a 'score' question",
+        id="noul answer to a score question",
+    ),
+    # a missing value
+    pytest.param("refund", {}, "'refund' is missing 'noul'", id="empty noul answer"),
+    pytest.param(
+        "refund",
+        {"type": "noul", "confidence": 0.9},
+        "'refund' is missing 'noul'",
+        id="noul without noul",
+    ),
+    pytest.param(
+        "dept",
+        {"type": "choice", "probabilities": CHOICE_PROBABILITIES},
+        "'dept' is missing 'choice'",
+        id="choice without choice",
+    ),
+    pytest.param(
+        "dept",
+        {"type": "choice", "choice": "billing"},
+        "'dept' is missing 'probabilities'",
+        id="choice without probabilities",
+    ),
+    pytest.param(
+        "dept", {}, "'dept' is missing 'choice', 'probabilities'", id="empty choice answer"
+    ),
+    pytest.param(
+        "urgency",
+        {"type": "score", "probabilities": SCORE_PROBABILITIES},
+        "'urgency' is missing 'score'",
+        id="score without score",
+    ),
+    pytest.param(
+        "urgency",
+        {"type": "score", "score": 1.0},
+        "'urgency' is missing 'probabilities'",
+        id="score without probabilities",
+    ),
+    pytest.param(
+        "dept",
+        {"type": "choice", "choice": "billing", "probabilities": {}},
+        "'dept' is missing 'probabilities'",
+        id="empty probabilities",
+    ),
+    pytest.param(
+        "dept",
+        {"type": "choice", "choice": "billing", "probabilities": {}, "answer_confidence": 0.9},
+        "'dept' is missing 'probabilities'",
+        id="empty probabilities with an answer_confidence",
+    ),
+    # a number that is missing, not a number, or not finite
+    pytest.param("refund", {"type": "noul", "noul": None}, "not finite numbers", id="noul null"),
+    pytest.param("refund", {"type": "noul", "noul": "abc"}, "not finite numbers", id="noul text"),
+    pytest.param("refund", {"type": "noul", "noul": NAN}, "not finite numbers", id="noul nan"),
+    pytest.param("refund", {"type": "noul", "noul": INF}, "not finite numbers", id="noul infinity"),
+    pytest.param(
+        "refund", {"type": "noul", "noul": -INF}, "not finite numbers", id="noul negative infinity"
+    ),
+    pytest.param(
+        "refund",
+        {"type": "noul", "noul": 10**400},
+        "not finite numbers",
+        id="noul too large for a float",
+    ),
+    pytest.param(
+        "refund",
+        {"type": "noul", "noul": 0.9, "answer_confidence": None},
+        "not finite numbers",
+        id="answer_confidence null",
+    ),
+    pytest.param(
+        "refund",
+        {"type": "noul", "noul": 0.9, "answer_confidence": "abc"},
+        "not finite numbers",
+        id="answer_confidence text",
+    ),
+    pytest.param(
+        "refund",
+        {"type": "noul", "noul": 0.9, "answer_confidence": NAN},
+        "not finite numbers",
+        id="answer_confidence nan",
+    ),
+    pytest.param(
+        "refund",
+        {"type": "noul", "noul": 0.9, "answer_confidence": INF},
+        "not finite numbers",
+        id="answer_confidence infinity",
+    ),
+    pytest.param(
+        "urgency",
+        {"type": "score", "score": NAN, "probabilities": SCORE_PROBABILITIES},
+        "not finite numbers",
+        id="score nan",
+    ),
+    pytest.param(
+        "urgency",
+        {"type": "score", "score": INF, "probabilities": SCORE_PROBABILITIES},
+        "not finite numbers",
+        id="score infinity",
+    ),
+    pytest.param(
+        "urgency",
+        {"type": "score", "score": "high", "probabilities": SCORE_PROBABILITIES},
+        "not finite numbers",
+        id="score text",
+    ),
+    pytest.param(
+        "dept",
+        {"type": "choice", "choice": "billing", "probabilities": ["billing", "tech"]},
+        "not finite numbers",
+        id="probabilities as a list",
+    ),
+    pytest.param(
+        "dept",
+        {"type": "choice", "choice": "billing", "probabilities": {"billing": None, "tech": 0.2}},
+        "not finite numbers",
+        id="probability null",
+    ),
+    pytest.param(
+        "dept",
+        {"type": "choice", "choice": "billing", "probabilities": {"billing": "x", "tech": 0.2}},
+        "not finite numbers",
+        id="probability text",
+    ),
+    pytest.param(
+        "dept",
+        {"type": "choice", "choice": "billing", "probabilities": {"billing": NAN, "tech": 0.2}},
+        "not finite numbers",
+        id="probability nan",
+    ),
+    pytest.param(
+        "dept",
+        {"type": "choice", "choice": "billing", "probabilities": {"billing": INF, "tech": 0.2}},
+        "not finite numbers",
+        id="probability infinity",
+    ),
+    pytest.param(
+        "dept",
+        {"type": "choice", "choice": "billing", "probabilities": {"billing": 0.8, "tech": NAN}},
+        "not finite numbers",
+        id="probability nan after a larger one",
+    ),
+    pytest.param(
+        "dept",
+        {"type": "choice", "choice": "billing", "probabilities": {"billing": 0.8, "tech": -INF}},
+        "not finite numbers",
+        id="probability negative infinity after a larger one",
+    ),
+]
+
+
+@pytest.mark.parametrize(("qid", "answer", "problem"), MALFORMED_ANSWERS)
+def test_a_malformed_backend_answer_is_model_unavailable(qid, answer, problem):
+    with pytest.raises(ModelUnavailable, match=problem) as caught:
+        from_backend({qid: answer}, {qid: QUESTIONS[qid]})
+    assert caught.value.hint == BACKEND_HINT
+
+
+@pytest.mark.parametrize(
+    ("usage", "field"),
+    [
+        pytest.param({"input_tokens": None}, "usage.input_tokens", id="input tokens null"),
+        pytest.param({"input_tokens": "many"}, "usage.input_tokens", id="input tokens text"),
+        pytest.param({"input_tokens": NAN}, "usage.input_tokens", id="input tokens nan"),
+        pytest.param({"input_tokens": INF}, "usage.input_tokens", id="input tokens infinity"),
+        pytest.param(
+            {"input_tokens": -INF}, "usage.input_tokens", id="input tokens negative infinity"
+        ),
+        pytest.param({"output_tokens": None}, "usage.output_tokens", id="output tokens null"),
+        pytest.param({"output_tokens": NAN}, "usage.output_tokens", id="output tokens nan"),
+    ],
+)
+def test_unusable_token_counts_are_model_unavailable(usage, field):
+    answers = {"refund": {"type": "noul", "noul": 0.9}}
+    with pytest.raises(ModelUnavailable, match=field) as caught:
+        from_backend(answers, {"refund": QUESTIONS["refund"]}, usage=usage)
+    assert caught.value.hint == BACKEND_HINT
+
+
+def test_numbers_sent_as_text_are_coerced():
+    answers = {
+        "refund": {"type": "noul", "noul": "0.25"},
+        "dept": {
+            "type": "choice",
+            "choice": "billing",
+            "probabilities": {"billing": "0.8", "tech": "0.2"},
+        },
+    }
+    questions = {"refund": QUESTIONS["refund"], "dept": QUESTIONS["dept"]}
+    usage = {"input_tokens": "12", "output_tokens": 3.0}
+    response = from_backend(answers, questions, usage=usage)
+    assert response["answers"]["refund"]["noul"] == 0.25
+    assert response["answers"]["refund"]["answer_confidence"] == 0.75
+    assert response["answers"]["dept"]["probabilities"] == {"billing": 0.8, "tech": 0.2}
+    assert response["answers"]["dept"]["answer_confidence"] == 0.8
+    assert response["usage"] == {"input_tokens": 12, "output_tokens": 3}
