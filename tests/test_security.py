@@ -46,10 +46,27 @@ def test_other_hosts_are_misdirected(host):
         ("http://evil.example", 403),
         ("null", 403),
         ("https://localhost:3000", 403),
+        ("http://127.0.0.1", 200),
+        ("http://localhost:7711", 200),
+        ("http://[::1]:7711", 200),
+        ("HTTP://LOCALHOST:7711", 200),
+        ("http://evil.example@localhost", 403),
+        ("http://localhost:3000, http://evil.example", 403),
+        ("http://localhost:abc", 403),
+        ("http://localhost/x?y", 403),
+        ("http://[", 403),
+        ("http://[127.0.0.1]", 403),
+        ("http://]", 403),
+        ("http://[x]", 403),
+        ("http://[::1", 403),
+        ("http://localhost]", 403),
     ],
 )
 def test_web_page_origins_are_refused(origin, status):
-    assert get(Origin=origin).status_code == status
+    response = get(Origin=origin)
+    assert response.status_code == status
+    if status == 403:
+        assert response.json()["error"]["code"] == "forbidden_origin"
 
 
 def test_the_token_is_required_except_on_health():
@@ -62,6 +79,7 @@ def test_the_token_is_required_except_on_health():
 def test_is_loopback_origin():
     assert is_loopback_origin("http://[::1]:8080")
     assert not is_loopback_origin("http://localhost.evil.example")
+    assert not is_loopback_origin("http://[127.0.0.1]")
 
 
 @pytest.mark.parametrize(

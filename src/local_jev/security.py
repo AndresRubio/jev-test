@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import hmac
 import json
+import re
 from collections.abc import Awaitable, Callable, MutableMapping
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
 
 from local_jev.errors import invalid, too_large
 
@@ -17,7 +17,9 @@ Receive = Callable[[], Awaitable[Message]]
 Send = Callable[[Message], Awaitable[None]]
 ASGIApp = Callable[[Scope, Receive, Send], Awaitable[None]]
 
-LOOPBACK_HOSTNAMES = ("127.0.0.1", "localhost", "::1")
+LOOPBACK_ORIGIN = re.compile(
+    r"http://(?:127\.0\.0\.1|localhost|\[::1\])(?::[0-9]{1,5})?", re.ASCII | re.IGNORECASE
+)
 
 
 def loopback_hosts(port: int) -> frozenset[str]:
@@ -25,8 +27,8 @@ def loopback_hosts(port: int) -> frozenset[str]:
 
 
 def is_loopback_origin(origin: str) -> bool:
-    parts = urlsplit(origin)
-    return parts.scheme == "http" and parts.hostname in LOOPBACK_HOSTNAMES
+    """True only for http://127.0.0.1, http://localhost or http://[::1], with or without a port."""
+    return LOOPBACK_ORIGIN.fullmatch(origin) is not None
 
 
 class SecurityMiddleware:
