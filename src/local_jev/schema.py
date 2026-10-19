@@ -127,7 +127,7 @@ def _parse_question(qid: str, question: Any) -> dict[str, Any]:
         if len(options) < 2:
             raise invalid(f"question {qid!r} needs at least 2 options", CHOICE_EXAMPLE)
         if len(options) > MAX_CHOICE_OPTIONS:
-            raise too_large(
+            raise invalid(
                 f"question {qid!r} has {len(options)} options; the limit is {MAX_CHOICE_OPTIONS}",
                 "split it into a coarse question and a fine question",
             )

@@ -86,6 +86,7 @@ def score(criteria):
             "labels",
         ),
         (choice(["only"]), 422, "at least 2"),
+        (choice([f"o{i}" for i in range(256)]), 422, "limit is 255"),
         (choice(["a", "a"]), 422, "unique"),
         (choice("a,b"), 422, "list of labels"),
         (choice(["a", "b"], labels={"true": "A", "false": "B"}), 422, "only supported on noul"),
