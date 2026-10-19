@@ -37,19 +37,19 @@ async def test_run_returns_the_job_result():
 
 @pytest.mark.anyio
 async def test_jobs_never_overlap():
-    engine = FakeEngine()
+    engine = FakeEngine(delay=0.01)
     runtime = Runtime(engine, idle_unload_seconds=0)
     try:
         await asyncio.gather(
             *(
-                runtime.run(lambda e: e.decide("yes", QUESTIONS, "auto"), timeout=5)
-                for _ in range(8)
+                runtime.run(lambda e, i=i: e.decide(f"s{i}", QUESTIONS, "auto"), timeout=5)
+                for i in range(8)
             )
         )
     finally:
         runtime.shutdown()
     assert engine.max_active == 1
-    assert len(engine.calls) == 8
+    assert [c[0] for c in engine.calls] == [f"s{i}" for i in range(8)]
 
 
 @pytest.mark.anyio
@@ -101,10 +101,17 @@ async def test_an_idle_engine_is_unloaded_once():
         assert runtime.check_idle() is False
         clock.now += 31
         assert runtime.check_idle() is True
-        await wait_for(lambda: engine.unload_calls == 1)
-        assert not engine.is_loaded()
+        await wait_for(lambda: not engine.is_loaded())
+        assert engine.unload_calls == 1
         clock.now += 120
         assert runtime.check_idle() is False
+        await runtime.run(lambda e: e.decide("b", QUESTIONS, "auto"), timeout=5)
+        await wait_for(lambda: runtime.pending == 0)
+        assert engine.is_loaded()
+        assert runtime.check_idle() is False
+        clock.now += 61
+        assert runtime.check_idle() is True
+        await wait_for(lambda: engine.unload_calls == 2)
     finally:
         runtime.shutdown()
 
