@@ -1,4 +1,7 @@
 import hashlib
+import os
+import re
+import shutil
 from pathlib import Path
 
 import pytest
@@ -16,6 +19,24 @@ def make_files(root: Path, name: str, weights: bytes = b"weights") -> None:
         path = folder / item
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(weights if item == "model.safetensors" else b"{}")
+
+
+def move_weights_behind_links(root: Path, name: str, *, shared_store: bool) -> Path:
+    """Lay the weights out like huggingface_hub and return the file that holds the bytes.
+
+    The snapshot has a relative symlink to blobs/<etag>. With the cache-wide shared blob store of
+    huggingface_hub 1.33.0, blobs/<etag> is itself a symlink to <cache>/blobs/<xx>/<hash>.
+    """
+    link = checkpoints.checkpoint_dir(root, name) / "model.safetensors"
+    blob = root.parents[1] / "blobs" / "etag"
+    holder = root.parents[2] / "blobs" / "xx" / "hash" if shared_store else blob
+    blob.parent.mkdir(parents=True, exist_ok=True)
+    holder.parent.mkdir(parents=True, exist_ok=True)
+    link.rename(holder)
+    if shared_store:
+        blob.symlink_to(os.path.relpath(holder, blob.parent))
+    link.symlink_to(os.path.relpath(blob, link.parent))
+    return holder
 
 
 def test_patterns_are_scoped_to_the_checkpoint_subfolder():
@@ -81,3 +102,61 @@ def test_verify_accepts_matching_weights_and_rejects_others(tmp_path):
             "english",
             expected=checkpoints.Checkpoint("english", None, "0" * 64, good.size),
         )
+
+
+@pytest.mark.parametrize("shared_store", [False, True], ids=["blob", "shared-store"])
+def test_the_checksum_hint_names_the_file_that_holds_the_bytes(tmp_path, shared_store):
+    root = checkpoints.snapshot_root(REPO, REVISION, tmp_path)
+    make_files(root, "english", b"corrupt weights")
+    holder = move_weights_behind_links(root, "english", shared_store=shared_store)
+    size = len(b"corrupt weights")
+    for expected in (
+        checkpoints.Checkpoint("english", None, "0" * 64, size),
+        checkpoints.Checkpoint("english", None, "0" * 64, size + 1),
+    ):
+        with pytest.raises(ChecksumMismatch) as info:
+            checkpoints.verify(root, "english", expected=expected)
+        assert info.value.hint == f"delete {holder.resolve()} and run `local-jev pull`"
+
+
+@pytest.mark.parametrize("shared_store", [False, True], ids=["blob", "shared-store"])
+def test_following_the_checksum_hint_lets_fetch_download_the_weights_again(
+    tmp_path, monkeypatch, shared_store
+):
+    root = checkpoints.snapshot_root(REPO, REVISION, tmp_path)
+    make_files(root, "english", b"corrupt weights")
+    holder = move_weights_behind_links(root, "english", shared_store=shared_store)
+    corrupt = checkpoints.Checkpoint("english", None, "0" * 64, len(b"corrupt weights"))
+    with pytest.raises(ChecksumMismatch) as info:
+        checkpoints.verify(root, "english", expected=corrupt)
+
+    match = re.fullmatch(r"delete (.+) and run `local-jev pull`", info.value.hint)
+    assert match, info.value.hint
+    named = Path(match.group(1))
+    if named.is_dir():
+        shutil.rmtree(named)
+    else:
+        named.unlink()
+
+    assert not holder.exists(), (
+        "the corrupt bytes survive, so huggingface_hub would link them again"
+    )
+    assert not checkpoints.is_complete(root, "english")
+
+    calls = []
+
+    def fake_download(repo_id, *, revision, allow_patterns, cache_dir):
+        calls.append(allow_patterns)
+        holder.write_bytes(b"good weights")
+        return str(root)
+
+    monkeypatch.setattr(checkpoints, "snapshot_download", fake_download)
+    assert (
+        checkpoints.fetch(REPO, REVISION, "english", allow_download=True, cache_dir=tmp_path)
+        == root
+    )
+    assert calls == [checkpoints.patterns("english")]
+    good = checkpoints.Checkpoint(
+        "english", None, hashlib.sha256(b"good weights").hexdigest(), len(b"good weights")
+    )
+    checkpoints.verify(root, "english", expected=good)

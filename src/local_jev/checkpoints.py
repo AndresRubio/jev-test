@@ -100,7 +100,10 @@ def verify(root: Path, name: str, *, expected: Checkpoint | None = None) -> None
     """Check the weight file against its pinned size and SHA-256."""
     expected = expected or CHECKPOINTS[name]
     path = checkpoint_dir(root, name) / "model.safetensors"
-    hint = f"delete {path.parent} and run `local-jev pull`"
+    # In the Hugging Face cache this path is a symlink and the bytes sit behind it. huggingface_hub
+    # relinks a deleted symlink to a blob that is still there without downloading, so the hint
+    # names the file the link resolves to. Deleting that leaves a dangling link, and pull downloads.
+    hint = f"delete {path.resolve()} and run `local-jev pull`"
     size = path.stat().st_size
     if size != expected.size:
         raise ChecksumMismatch(f"{path} is {size} bytes, expected {expected.size}", hint)
