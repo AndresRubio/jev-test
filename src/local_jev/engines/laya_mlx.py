@@ -16,6 +16,8 @@ from local_jev.schema import MODEL_HINT as UNKNOWN_MODEL_HINT
 SHORTLIST_K = 20
 LOAD_HINT = f"{checkpoints.PULL_HINT}, or check that laya-mlx is 0.4.0"
 
+Questions = dict[str, dict[str, Any]]
+
 
 def _laya() -> Any:
     import laya_mlx
@@ -78,7 +80,7 @@ class LayaMLXEngine:
             model=f"laya-{name}",
             checkpoint=name,
             routing_reason=reason,
-            shortlist=_narrowed(raw.get("tournament", {})),
+            shortlist=_shortlist(raw.get("tournament", {})),
         )
 
     def count_tokens(self, text: str, model: str) -> int:
@@ -114,7 +116,9 @@ class LayaMLXEngine:
                     self._downloading.discard(name)
 
     def is_loaded(self) -> bool:
-        return bool(self._router.loaded)
+        # Cached count_tokens tokenizers count too, so the idle unload frees them. Reading the
+        # dict's size needs no lock.
+        return bool(self._router.loaded) or bool(self._tokenizers)
 
     def unload(self) -> None:
         """Free the checkpoints and the tokenizers count_tokens cached; each is rebuilt on next use."""
@@ -171,12 +175,13 @@ class LayaMLXEngine:
         self, router: Any, state: Any, questions: dict[str, dict[str, Any]], name: str
     ) -> dict[str, Any]:
         self._load(router, name)
-        if any(
-            q["type"] == "choice" and len(q["criteria"]) > SHORTLIST_K for q in questions.values()
-        ):
+        if any(_needs_tournament(question) for question in questions.values()):
             # The group size equals the threshold, so a choice of 20 or fewer options in the same
             # request reaches the final call whole.
-            return self._tournament(router, state, questions, group_size=SHORTLIST_K, model=name)
+            recorder = _RoundRecorder(router, questions)
+            raw = self._tournament(recorder, state, questions, group_size=SHORTLIST_K, model=name)
+            usage = _with_round_warnings(raw.get("usage", {}), recorder.calls[:-1], questions)
+            return {**raw, "usage": usage}
         return router.predict(state, questions, model=name)
 
     @staticmethod
@@ -210,7 +215,138 @@ class LayaMLXEngine:
             router.unload()
 
 
-def _narrowed(tournament: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+class _RoundRecorder:
+    """The Router as predict_tournament sees it: every call is forwarded and kept.
+
+    Every call but the last is an elimination round, whose questions carry the tournament's own
+    ids ("0", "1", ...). A ValueError that names one of them is raised again naming the caller's
+    question.
+    """
+
+    def __init__(self, router: Any, questions: Questions) -> None:
+        self._router = router
+        self._questions = questions
+        self.calls: list[tuple[Questions, dict[str, Any]]] = []
+
+    def predict(self, state: Any, questions: Questions, **kwargs: Any) -> dict[str, Any]:
+        try:
+            result = self._router.predict(state, questions, **kwargs)
+        except ValueError as exc:
+            renamed = _renamed(exc, questions, self._questions)
+            if renamed is None:
+                raise
+            raise renamed from exc
+        self.calls.append((questions, result.get("usage") or {}))
+        return result
+
+
+def _needs_tournament(question: dict[str, Any]) -> bool:
+    return question["type"] == "choice" and len(question["criteria"]) > SHORTLIST_K
+
+
+def _sources(group: dict[str, Any], questions: Questions) -> list[str]:
+    """The caller's questions that a tournament question could have been cut from.
+
+    predict_tournament cuts a narrowed choice's criteria to a subset and keeps its other fields,
+    so a source needs the tournament, has the same other fields and has every label of the group.
+    Identical sources cannot be told apart, so all of them are returned. Only choices are cut,
+    and only their labels are sure to be strings (a score level may be an object).
+    """
+    if group.get("type") != "choice":
+        return []
+    labels = set(group["criteria"])
+    fields = _without_criteria(group)
+    return [
+        qid
+        for qid, question in questions.items()
+        if _needs_tournament(question)
+        and _without_criteria(question) == fields
+        and labels <= set(question["criteria"])
+    ]
+
+
+def _without_criteria(question: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in question.items() if key != "criteria"}
+
+
+def _with_round_warnings(
+    usage: dict[str, Any], rounds: list[tuple[Questions, dict[str, Any]]], questions: Questions
+) -> dict[str, Any]:
+    """The final call's usage, plus the truncation and collapsed options of the rounds before it.
+
+    Token counts stay the final call's. A round names its groups, so each group's warning goes to
+    the caller's question the group was cut from.
+    """
+    merged = dict(usage)
+    round_usages = [round_usage for _, round_usage in rounds]
+    if any(round_usage.get("truncated") for round_usage in round_usages):
+        truncating = [u for u in [*round_usages, usage] if u.get("truncated")]
+        cut = set(usage.get("truncated_questions") or ())
+        for call, round_usage in rounds:
+            for gid in round_usage.get("truncated_questions") or ():
+                cut.update(_sources(call[gid], questions))
+        merged.update(
+            truncated=True,
+            truncated_questions=[qid for qid in questions if qid in cut],
+            state_tokens=max(u.get("state_tokens", 0) for u in truncating),
+            state_tokens_dropped=max(u.get("state_tokens_dropped", 0) for u in truncating),
+        )
+    collapsed = _round_collapses(rounds, questions)
+    if collapsed:
+        merged["options"] = {**(usage.get("options") or {}), **collapsed}
+    return merged
+
+
+def _round_collapses(
+    rounds: list[tuple[Questions, dict[str, Any]]], questions: Questions
+) -> dict[str, dict[str, int]]:
+    """Each caller question whose groups collapsed, summed over all its groups in that round.
+
+    A group that did not collapse counts all of its options as distinct, so the sums cover every
+    option the round saw. The first round that collapsed a question wins, since it saw the most.
+    """
+    found: dict[str, dict[str, int]] = {}
+    for call, round_usage in rounds:
+        options = round_usage.get("options") or {}
+        if not options:
+            continue
+        sources = {gid: _sources(group, questions) for gid, group in call.items()}
+        hit = {qid for gid in options for qid in sources[gid]}
+        for qid in questions:
+            if qid not in hit or qid in found:
+                continue
+            total = distinct = 0
+            for gid, group in call.items():
+                if qid in sources[gid]:
+                    entry = options.get(gid, {})
+                    total += entry.get("total", len(group["criteria"]))
+                    distinct += entry.get("distinct", len(group["criteria"]))
+            found[qid] = {"total": total, "distinct": distinct}
+    return found
+
+
+def _renamed(error: ValueError, call: Questions, questions: Questions) -> ValueError | None:
+    """The error naming the caller's question when it names a tournament group, else None.
+
+    laya-mlx starts a question's error with "Question <id>". In the final call that id is the
+    caller's own: the question is either unchanged or cut from the caller's question of that id.
+    """
+    message = str(error)
+    for gid, group in call.items():
+        prefix = f"Question {gid!r}"
+        if not message.startswith(prefix):
+            continue
+        sources = _sources(group, questions)
+        if not sources or gid in sources or group == questions.get(gid):
+            return None
+        named = " or ".join(repr(qid) for qid in sources)
+        return ValueError(
+            f"Question {named}{message[len(prefix) :]} (it was narrowed in groups of {SHORTLIST_K})"
+        )
+    return None
+
+
+def _shortlist(tournament: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
     """The choices the tournament narrowed, in the shortlist shape guard.finalize reads.
 
     A choice that needed no round (rounds == 0) went to the final call whole, so it is left out.
