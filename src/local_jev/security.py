@@ -32,6 +32,17 @@ def fits_in_a_header(value: str) -> bool:
     return value.isascii() and value.isprintable() and value == value.strip()
 
 
+class Secret(str):
+    """A token whose repr hides it, for code that shows the arguments it holds.
+
+    Starlette's Middleware repr lists the keyword arguments the middleware gets, the token among
+    them. The value itself, in an f-string or as bytes, is unchanged.
+    """
+
+    def __repr__(self) -> str:
+        return "'***'"
+
+
 def loopback_hosts(port: int) -> frozenset[str]:
     return frozenset({f"127.0.0.1:{port}", f"localhost:{port}", f"[::1]:{port}"})
 

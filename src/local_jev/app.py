@@ -15,7 +15,7 @@ from local_jev.api_mcp import build_mcp_server
 from local_jev.api_rest import MAX_BODY_BYTES, build_rest_routes
 from local_jev.config import Settings
 from local_jev.engines.base import Engine
-from local_jev.security import SecurityMiddleware, loopback_hosts
+from local_jev.security import Secret, SecurityMiddleware, loopback_hosts
 from local_jev.service import DecisionService
 
 LOOPBACK_ORIGINS = ("http://127.0.0.1", "http://localhost", "http://[::1]")
@@ -73,8 +73,9 @@ def create_app(settings: Settings, *, service: DecisionService | None = None) ->
         finally:
             await service.stop()
 
+    token = None if settings.token is None else Secret(settings.token)
     return Starlette(
         routes=[*build_rest_routes(service), Mount("/", app=mcp_app)],
-        middleware=[Middleware(SecurityMiddleware, port=settings.port, token=settings.token)],
+        middleware=[Middleware(SecurityMiddleware, port=settings.port, token=token)],
         lifespan=lifespan,
     )

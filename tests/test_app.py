@@ -481,6 +481,13 @@ def test_the_token_guards_rest_and_mcp_but_not_health(settings):
         )
 
 
+def test_the_middleware_list_never_shows_the_token(settings):
+    # Starlette's Middleware repr lists the arguments it was given, and the token is one of them.
+    settings = dataclasses.replace(settings, token="probe-token-8")
+    with client_for(settings) as client:
+        assert "probe-token-8" not in repr(client.app.user_middleware)
+
+
 def test_the_lifespan_starts_the_service_then_mcp_and_stops_them_in_reverse(settings, monkeypatch):
     events = []
 
