@@ -50,7 +50,7 @@ class Settings:
     port: int = 7711
     backend: str = "laya-mlx"
     idle_unload_minutes: float = 15.0
-    noul_mode: str = "native"
+    noul_mode: str = "ab_labels"
     log_inputs: bool = False
     token: str | None = None
     request_timeout_seconds: float = 30.0

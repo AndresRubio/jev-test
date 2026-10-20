@@ -11,7 +11,7 @@ def test_defaults_when_the_file_is_missing(tmp_path):
     assert settings == Settings()
     assert settings.port == 7711
     assert settings.backend == "laya-mlx"
-    assert settings.noul_mode == "native"
+    assert settings.noul_mode == "ab_labels"
     assert settings.laya.revision == LAYA_REVISION
     assert settings.laya.prefetch == ("english", "multilingual")
     assert settings.batch.max_items == 5000
@@ -20,13 +20,13 @@ def test_defaults_when_the_file_is_missing(tmp_path):
 def test_file_values_are_read(tmp_path):
     config = tmp_path / "config.toml"
     config.write_text(
-        'port = 7800\nnoul_mode = "ab_labels"\nlog_inputs = true\n\n'
+        'port = 7800\nnoul_mode = "native"\nlog_inputs = true\n\n'
         '[laya]\nprefetch = ["english"]\n\n'
         '[batch]\nallowed_roots = ["~/data"]\nmax_items = 10\n'
     )
     settings = load_settings(config, env={})
     assert settings.port == 7800
-    assert settings.noul_mode == "ab_labels"
+    assert settings.noul_mode == "native"
     assert settings.log_inputs is True
     assert settings.laya.prefetch == ("english",)
     assert settings.batch.allowed_roots == (Path("~/data").expanduser(),)
