@@ -167,6 +167,35 @@ def test_a_relative_path_in_the_environment_is_taken_from_the_current_folder(
     assert getattr(settings, name) == tmp_path / "state" / "here"
 
 
+NO_SUCH_USER = "~local-jev-no-such-user"
+
+
+@pytest.mark.parametrize(
+    ("text", "env", "where"),
+    [
+        (f'log_dir = "{NO_SUCH_USER}/logs"\n', {}, "log_dir"),
+        (f'[batch]\nallowed_roots = ["{NO_SUCH_USER}"]\n', {}, "batch.allowed_roots"),
+        ("", {"LOCAL_JEV_RESULTS_DIR": f"{NO_SUCH_USER}/results"}, "LOCAL_JEV_RESULTS_DIR"),
+    ],
+    ids=["file path", "file path list", "environment path"],
+)
+def test_a_path_from_the_home_folder_of_an_unknown_user_is_refused(tmp_path, text, env, where):
+    # Path.expanduser raises RuntimeError for it, which no command catches.
+    config = tmp_path / "config.toml"
+    config.write_text(text)
+    with pytest.raises(ConfigError) as info:
+        load_settings(config, env=env)
+    assert str(info.value) == f"{where} starts with {NO_SUCH_USER}, a user this Mac does not have"
+
+
+def test_a_config_path_in_the_home_folder_of_an_unknown_user_is_refused():
+    with pytest.raises(ConfigError) as info:
+        load_settings(env={"LOCAL_JEV_CONFIG": f"{NO_SUCH_USER}/config.toml"})
+    assert str(info.value) == (
+        f"LOCAL_JEV_CONFIG starts with {NO_SUCH_USER}, a user this Mac does not have"
+    )
+
+
 def test_the_token_stays_out_of_the_settings_repr(tmp_path):
     settings = load_settings(tmp_path / "missing.toml", env={"LOCAL_JEV_TOKEN": "probe-token-8"})
     assert settings.token == "probe-token-8"

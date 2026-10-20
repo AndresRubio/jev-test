@@ -113,7 +113,7 @@ def load_settings(path: Path | None = None, env: Mapping[str, str] | None = None
     env = os.environ if env is None else env
     if path is None:
         path = Path(env.get(CONFIG_ENV) or DEFAULT_CONFIG_PATH)
-    path = path.expanduser()
+    path = _expanded(str(path), CONFIG_ENV)
     data: dict[str, Any] = {}
     if path.exists():
         try:
@@ -199,12 +199,24 @@ def _coerce(kind: Any, value: Any, where: str) -> Any:
     if kind is Path:
         if not isinstance(value, str) or not value:
             raise ConfigError(f"{where} must be a path")
-        return Path(value).expanduser()
+        return _expanded(value, where)
     if kind in ("names", "paths"):
         if not isinstance(value, list) or not all(isinstance(v, str) and v for v in value):
             raise ConfigError(f"{where} must be a list of strings")
-        return tuple(Path(v).expanduser() for v in value) if kind == "paths" else tuple(value)
+        return tuple(_expanded(v, where) for v in value) if kind == "paths" else tuple(value)
     raise AssertionError(f"unhandled setting type for {where}")
+
+
+def _expanded(value: str, where: str) -> Path:
+    """The path with a leading ~ or ~user replaced by that home folder.
+
+    Path.expanduser raises RuntimeError for a user the Mac does not have.
+    """
+    try:
+        return Path(value).expanduser()
+    except RuntimeError as exc:
+        user = value.split("/", 1)[0]
+        raise ConfigError(f"{where} starts with {user}, a user this Mac does not have") from exc
 
 
 def _validate(s: Settings) -> None:
