@@ -188,6 +188,7 @@ Errors are returned as `{"error": {"code", "message", "hint"}}`:
 | 421 | `misdirected` | The Host header is not a loopback host. |
 | 413 | `too_large` | The body exceeds 5 MB, or a limit in §6.1 or §6.2 is exceeded. |
 | 422 | `invalid_request` | Validation failed. The `hint` explains the fix. |
+| 500 | `internal_error` | An unexpected error. The message is "unexpected server error", the hint is "see server.log", and `server.log` holds the traceback. |
 | 503 | `model_unavailable` | The model failed to load, or its outputs were not finite after the 32-bit retry. |
 | 504 | `timeout` | The request took more than 30 s (300 s for batches). |
 | 529 | `busy` | The queue is full; retry with backoff. |
@@ -313,9 +314,10 @@ claude mcp add --transport http --scope user local-jev http://127.0.0.1:7711/mcp
 
 - **Binding.** The server binds to `127.0.0.1` only; there is no option to bind other addresses in v1.
 - **Host and Origin checks.** Middleware on every route rejects a Host that is not `127.0.0.1:<port>`, `localhost:<port>` or `[::1]:<port>`, with a 421. It rejects, with a 403, any Origin that is present and is not a loopback origin (`http://127.0.0.1`, `http://localhost` or `http://[::1]`, on any port). This includes `Origin: null`. The MCP SDK's own transport security is also configured with the same loopback allowlist.
-- **Optional bearer token** (`LOCAL_JEV_TOKEN`), checked on every route except `/health`. `connect` includes the header when a token is set. `install-agent` copies a set token into the plist's `EnvironmentVariables` and writes the plist with mode 600.
+- **Optional bearer token** (`LOCAL_JEV_TOKEN`), checked on every route except `/health`. Loopback is reachable from every account on the Mac, so set a token on a Mac with other accounts. `connect` includes the header when a token is set. `install-agent` copies the `LOCAL_JEV_*` variables that are set, `HF_HOME` and `HF_HUB_CACHE` into the plist's `EnvironmentVariables`, with their paths made absolute. For a remote backend it also copies the variable named by `remote.api_key_env`. It writes the plist with mode 600.
 - **File policy for `decide_batch`.**
   - The path must be absolute and resolve, after following symlinks, to a regular file under `batch.allowed_roots` (default: the home directory).
+  - `batch.allowed_roots`, `log_dir` and `results_dir` in the config file must be absolute; a leading `~` is expanded. The login agent starts in `/`, where a relative root such as `.` would allow the whole disk.
   - The file is at most 50 MB, is decoded as UTF-8 with replacement characters for bad bytes, and is opened read-only.
   - Results are written only under `~/Library/Caches/local-jev/results/`. Files there older than 7 days are deleted when the server starts.
 - **Nothing is executed.** No part of the state or a file is ever run. The only outbound network calls are Hugging Face downloads, during `pull` or on first use, and the opt-in remote backend.
@@ -443,3 +445,4 @@ New releases appeared between drafting and approval. The plan follows these chan
 | `warnings` are strings that start with a code; `usage` holds only Jev's fields; Laya's `action` is dropped | Jev compatibility, and readable messages for agents. |
 | `httpx2` instead of `httpx` | It is already a dependency of the MCP SDK, and Starlette's test client prefers it. |
 | 2026-10-20: more than 20 options are narrowed by `laya_mlx.predict_tournament` in groups of at most 20 (was `predict_shortlist` with `embed_fn_from_agent`) | On the real weights, the embedding shortlist dropped the right label in 3 of 3 cases with 30 options, and the engine gave a wrong answer at 0.82 to 0.98 each time. The tournament picked the right label in all three (0.93 to 0.96). |
+| 2026-10-20: a 500 `internal_error` for unexpected errors (§6.1); `install-agent` also copies the variable named by `remote.api_key_env` for a remote backend, `allowed_roots`, `log_dir` and `results_dir` in the config file must be absolute, and loopback is reachable from every account, so set a token on a Mac with other accounts (§9) | The final review of the branch found that unexpected errors reached clients as plain text, that a remote backend under launchd sent no API key, that under launchd a relative path resolves against `/`, where `.` as an allowed root opens the whole disk, and that another account on the Mac can have `decide_batch` read the owner's files when no token is set. |

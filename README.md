@@ -37,7 +37,7 @@ local-jev serve
 local-jev install-agent
 ```
 
-`install-agent` runs local-jev at login instead, through a launchd agent, and also starts it now. It shows the plist it will write and asks before installing.
+`install-agent` runs local-jev at login instead, through a launchd agent, and also starts it now. It shows the plist it will write and asks before installing. The login agent and a `local-jev serve` in a terminal cannot both bind the port, and while the terminal server holds it, launchd restarts the agent every 10 seconds.
 
 ```bash
 local-jev status
@@ -122,11 +122,11 @@ url = ""                        # e.g. "http://127.0.0.1:8009/v1/systemone" for 
 api_key_env = ""                # the environment variable that holds the remote API key
 ```
 
-The file also takes `log_dir`, `results_dir`, `request_timeout_seconds` (30) and `queue_limit` (64) at the top, `repo` and `revision` under `[laya]`, and `max_items` (5000), `max_file_bytes` (50 MB), `max_evaluations` (20000), `group_size` (32) and `timeout_seconds` (300) under `[batch]`. An unknown key or a bad value stops every command with `config error: ...`.
+The file also takes `log_dir`, `results_dir`, `request_timeout_seconds` (30) and `queue_limit` (64) at the top, `repo` and `revision` under `[laya]`, and `max_items` (5000), `max_file_bytes` (50 MB), `max_evaluations` (20000), `group_size` (32) and `timeout_seconds` (300) under `[batch]`. An unknown key or a bad value stops every command except `uninstall-agent` with `config error: ...`.
 
-`LOCAL_JEV_CONFIG` points at another config file, and these environment variables override the file: `LOCAL_JEV_PORT`, `LOCAL_JEV_BACKEND`, `LOCAL_JEV_REMOTE_URL`, `LOCAL_JEV_IDLE_UNLOAD_MINUTES`, `LOCAL_JEV_NOUL_MODE`, `LOCAL_JEV_LOG_INPUTS`, `LOCAL_JEV_LOG_DIR` and `LOCAL_JEV_RESULTS_DIR`. launchd does not read your shell profile, so `install-agent` copies the `LOCAL_JEV_*` variables that are set, and `HF_HOME` and `HF_HUB_CACHE`, into the login agent, with paths made absolute. Run `install-agent` again after you change one; it replaces the agent and restarts it.
+`LOCAL_JEV_CONFIG` points at another config file, and these environment variables override the file: `LOCAL_JEV_PORT`, `LOCAL_JEV_BACKEND`, `LOCAL_JEV_REMOTE_URL`, `LOCAL_JEV_IDLE_UNLOAD_MINUTES`, `LOCAL_JEV_NOUL_MODE`, `LOCAL_JEV_LOG_INPUTS`, `LOCAL_JEV_LOG_DIR` and `LOCAL_JEV_RESULTS_DIR`. launchd does not read your shell profile, so `install-agent` copies the `LOCAL_JEV_*` variables that are set, and `HF_HOME` and `HF_HUB_CACHE`, into the login agent, with paths made absolute. With `backend = "remote"` it also copies the variable that `remote.api_key_env` names, shows its value masked in the preview as it does the token's, and prints a warning when that variable is not set. Run `install-agent` again after you change one; it replaces the agent and restarts it.
 
-Set `LOCAL_JEV_TOKEN` to require a bearer token on every request except `GET /health`. The CLI sends it, `install-agent` copies it into the plist (mode 600), and `connect` prints the `claude mcp add` command with `--header "Authorization: Bearer $LOCAL_JEV_TOKEN"` at the end. Whether your shell fills in the variable or `connect --apply` passes the token, `claude mcp add` gets the token on its command line, so it shows in the process list (`ps`) while that command runs.
+Set `LOCAL_JEV_TOKEN` to require a bearer token on every request except `GET /health`. Set one on a Mac with other user accounts: every account can reach 127.0.0.1, so without a token another account can ask the server to read files in your home folder through `decide_batch` and get snippets back. The CLI sends the token, `install-agent` copies it into the plist (mode 600), and `connect` prints the `claude mcp add` command with `--header "Authorization: Bearer $LOCAL_JEV_TOKEN"` at the end. Whether your shell fills in the variable or `connect --apply` passes the token, `claude mcp add` gets the token on its command line, so it shows in the process list (`ps`) while that command runs.
 
 ## Files
 
@@ -136,7 +136,7 @@ The paths are the defaults; `log_dir` and `results_dir` move the logs and the re
 |---|---|
 | `~/Library/Logs/local-jev/server.log` | Server log, rotated at 10 MB with 5 old files kept |
 | `~/Library/Logs/local-jev/decisions.jsonl` | One line per decision, rotated the same way; metadata only unless `log_inputs` is on |
-| `~/Library/Logs/local-jev/launchd.out.log` and `launchd.err.log` | Output of the login agent; the error log repeats the server log and is not rotated |
+| `~/Library/Logs/local-jev/launchd.out.log` and `launchd.err.log` | Output of the login agent; the error log gets what the server writes outside `server.log`, such as a config error, and is not rotated |
 | `~/Library/Caches/local-jev/results/` | `decide_batch` result files; the server deletes the ones older than 7 days when it starts |
 | `~/Library/LaunchAgents/io.github.andresrubio.local-jev.plist` | The login agent, written by `install-agent` |
 | `~/.cache/huggingface/hub/models--convaiinnovations--laya/` | Model weights; `HF_HOME` or `HF_HUB_CACHE` moves them |
