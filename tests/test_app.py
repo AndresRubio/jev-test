@@ -4,6 +4,7 @@ import socket
 import threading
 import time
 from contextlib import asynccontextmanager, contextmanager
+from pathlib import Path
 
 import httpx2
 import pytest
@@ -199,6 +200,71 @@ def test_a_non_finite_number_as_a_batch_item_id_is_422(settings, literal):
     assert literal in error["message"]
     assert error["hint"] == "send a JSON object"
     assert engine.calls == []
+
+
+def strict_json(text):
+    """json.loads, refusing NaN and the infinities as the JSON standard does."""
+
+    def refuse(name):
+        raise ValueError(f"{name} is not JSON")
+
+    return json.loads(text, parse_constant=refuse)
+
+
+@pytest.mark.parametrize("literal", ["NaN", "1e400", "-Infinity"])
+def test_a_non_finite_id_in_a_jsonl_file_is_422_before_any_model_call(settings, tmp_path, literal):
+    # The batch used to run, then fail to write its response and leave NaN in the results file.
+    path = tmp_path / "items.jsonl"
+    path.write_text(f'{{"id": 1, "text": "billing"}}\n{{"id": {literal}, "text": "tech"}}\n')
+    engine = FakeEngine()
+    body = {"questions": DEPT, "path": str(path), "field": "text"}
+    with client_for(settings, engine=engine, raise_server_exceptions=False) as client:
+        response = client.post("/v1/batch", json=body)
+    assert response.status_code == 422
+    assert response.headers["content-type"] == "application/json"
+    error = response.json()["error"]
+    assert error["code"] == "invalid_request"
+    assert error["message"].startswith("line 2 is not valid JSON: ")
+    assert literal in error["message"]
+    assert engine.calls == []
+    assert not settings.results_dir.exists()
+
+
+def mcp_session(client):
+    """Open an MCP session over a TestClient; return the headers that carry it."""
+    headers = {"accept": "application/json, text/event-stream", **JSON}
+    response = client.post("/mcp", json=MCP_INITIALIZE, headers=headers)
+    headers.update(
+        {
+            "mcp-session-id": response.headers["mcp-session-id"],
+            "mcp-protocol-version": MCP_INITIALIZE["params"]["protocolVersion"],
+        }
+    )
+    initialized = {"jsonrpc": "2.0", "method": "notifications/initialized"}
+    client.post("/mcp", json=initialized, headers=headers)
+    return headers
+
+
+@pytest.mark.parametrize("literal", ["NaN", "1e400", "-Infinity"])
+def test_an_inline_item_id_that_mcp_reads_as_a_non_finite_number_becomes_its_number(
+    settings, literal
+):
+    # The MCP SDK parses a request with pydantic_core.from_json, which accepts these literals.
+    arguments = f'{{"questions": {json.dumps(DEPT)}, "items": [{{"id": {literal}, "text": "tech"}}, "billing"]}}'
+    call = (
+        '{"jsonrpc": "2.0", "id": 2, "method": "tools/call", '
+        f'"params": {{"name": "decide_batch", "arguments": {arguments}}}}}'
+    )
+    with client_for(settings) as client:
+        response = client.post("/mcp", content=call.encode(), headers=mcp_session(client))
+    data = next(line for line in response.text.splitlines() if line.startswith("data: "))
+    result = strict_json(data.removeprefix("data: "))["result"]
+    assert result["isError"] is False
+    shown = strict_json(result["content"][0]["text"])
+    assert [match["id"] for match in shown["matches"]] == [1, 2]
+    assert [match["id"] for match in result["structuredContent"]["matches"]] == [1, 2]
+    lines = Path(shown["output_path"]).read_text().splitlines()
+    assert [strict_json(line)["id"] for line in lines] == [1, 2]
 
 
 def test_a_long_out_of_range_number_is_not_echoed_in_full(settings):

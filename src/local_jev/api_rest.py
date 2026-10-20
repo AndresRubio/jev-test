@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import math
 from collections.abc import Awaitable, Callable
 from contextlib import aclosing
 from typing import Any
@@ -13,6 +12,7 @@ from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
 from local_jev.errors import ServiceError, invalid, too_large
+from local_jev.schema import finite_float, refuse_constant
 
 MAX_BODY_BYTES = 5 * 1024 * 1024
 
@@ -64,7 +64,7 @@ async def _guarded(
 async def _read_json(request: Request) -> Any:
     body = await _read_body(request)
     try:
-        return json.loads(body, parse_constant=_refuse_constant, parse_float=_finite_float)
+        return json.loads(body, parse_constant=refuse_constant, parse_float=finite_float)
     except (ValueError, RecursionError) as exc:
         # JSONDecodeError and UnicodeDecodeError are ValueErrors. An integer of more than 4,300
         # digits raises a plain ValueError, and deeply nested arrays raise RecursionError.
@@ -91,17 +91,3 @@ async def _read_body(request: Request) -> bytearray:
                 )
             body.extend(chunk)
     return body
-
-
-def _refuse_constant(name: str) -> Any:
-    """NaN and the infinities are not JSON. json.loads reads them, but no response can hold them."""
-    raise ValueError(f"{name} is not allowed")
-
-
-def _finite_float(text: str) -> float:
-    """float(text), refusing a literal such as 1e400 that overflows to an infinity."""
-    number = float(text)
-    if not math.isfinite(number):
-        shown = text if len(text) <= 32 else f"{text[:29]}..."
-        raise ValueError(f"the number {shown} is out of range")
-    return number

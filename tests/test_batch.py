@@ -341,7 +341,7 @@ def test_write_and_clean_up_results(tmp_path):
     assert path.suffix == ".jsonl"
     assert lines[0]["warnings"] == ["relevant: shortlisted: x"]
     assert lines[1]["checkpoint"] == "english"
-    old = tmp_path / "results" / "old.jsonl"
+    old = tmp_path / "results" / "20261001T120000Z-0123abcd.jsonl"
     old.write_text("{}\n")
     os.utime(old, (time.time() - 8 * 24 * 3600,) * 2)
     assert cleanup_results(tmp_path / "results") == 1
@@ -361,11 +361,11 @@ def test_results_keep_text_that_is_not_valid_unicode_as_json_escapes(tmp_path):
 def test_cleanup_skips_entries_it_cannot_remove(tmp_path):
     results = tmp_path / "results"
     results.mkdir()
-    old = results / "old.jsonl"
+    old = results / "20261001T120000Z-0123abcd.jsonl"
     old.write_text("{}\n")
-    folder = results / "folder.jsonl"
+    folder = results / "20261001T120000Z-4567cdef.jsonl"
     folder.mkdir()
-    os.symlink(results / "missing", results / "broken.jsonl")
+    os.symlink(results / "missing", results / "20261001T120000Z-89abcdef.jsonl")
     ancient = time.time() - 8 * 24 * 3600
     for entry in (old, folder):
         os.utime(entry, (ancient, ancient))
@@ -677,3 +677,64 @@ def test_inline_items_over_the_limit_are_refused_before_any_is_checked():
         load_items(over, path=None, count_tokens=words, max_items=2)
     assert info.value.status == 413
     assert info.value.message == "3 items; the limit is 2"
+
+
+# Final review: numbers JSON cannot hold, and the files the results cleanup may delete.
+
+
+@pytest.mark.parametrize(
+    ("line", "reason"),
+    [
+        ('{"id": NaN, "text": "tech"}', "NaN is not allowed"),
+        ('{"id": 1e400, "text": "tech"}', "the number 1e400 is out of range"),
+        ('{"id": -Infinity, "text": "tech"}', "-Infinity is not allowed"),
+        ('{"text": "tech", "score": NaN}', "NaN is not allowed"),
+    ],
+    ids=["NaN id", "1e400 id", "-Infinity id", "NaN elsewhere"],
+)
+def test_a_jsonl_line_with_a_number_json_cannot_hold_is_refused(tmp_path, line, reason):
+    # json.loads reads these and turns 1e400 into an infinity, which no response or results file
+    # can hold. The REST body parser refuses them the same way.
+    path = tmp_path / "items.jsonl"
+    path.write_text('{"id": 1, "text": "billing"}\n' + line + "\n")
+    with pytest.raises(ServiceError) as info:
+        load_items(params(path=str(path)), path=path, count_tokens=words, max_items=5)
+    assert (info.value.status, info.value.code) == (422, "invalid_request")
+    assert info.value.message == f"line 2 is not valid JSON: {reason}"
+    assert info.value.hint == "each line must hold one JSON value"
+
+
+@pytest.mark.parametrize("literal", ["NaN", "1e400", "-Infinity"])
+def test_an_inline_item_whose_id_is_not_a_finite_number_goes_by_its_number(literal):
+    # MCP reads requests with pydantic_core.from_json, which turns these literals into floats.
+    items = load_items(
+        params(items=["a", {"id": float(literal), "text": "b"}, {"id": 2.5, "text": "c"}]),
+        path=None,
+        count_tokens=words,
+        max_items=5,
+    )
+    assert [(item.id, item.n) for item in items] == [(1, 1), (2, 2), (2.5, 3)]
+
+
+def test_cleanup_removes_old_result_files_and_leaves_the_users_own_files(tmp_path):
+    # results_dir may point at a folder that also holds the user's own files.
+    results = tmp_path / "results"
+    written = write_results(results, [record(1)])
+    own = [
+        "my-export.jsonl",
+        "20261001T120000Z-0123ABCD.jsonl",
+        "20261001T120000Z-0123abcd.jsonl.bak",
+        "copy of 20261001T120000Z-0123abcd.jsonl",
+        "20261001T12000Z-0123abcd.jsonl",
+        "20261001T120000-0123abcd.jsonl",
+        "20261001T120000Z-0123abc.jsonl",
+        "٢٠٢٦١٠٠١T120000Z-0123abcd.jsonl",
+    ]
+    for name in own:
+        (results / name).write_text("{}\n")
+    ancient = time.time() - 8 * 24 * 3600
+    for path in results.iterdir():
+        os.utime(path, (ancient, ancient))
+    assert cleanup_results(results) == 1
+    assert not written.exists()
+    assert sorted(path.name for path in results.iterdir()) == sorted(own)

@@ -7,6 +7,7 @@ import io
 import json
 import math
 import os
+import re
 import secrets
 import stat
 import time
@@ -19,7 +20,14 @@ from typing import Any
 
 from local_jev.errors import ServiceError, invalid, too_large
 from local_jev.guard import compact_answers, warning_code
-from local_jev.schema import parse_model, parse_questions, parse_state
+from local_jev.schema import (
+    NonFiniteNumber,
+    finite_float,
+    parse_model,
+    parse_questions,
+    parse_state,
+    refuse_constant,
+)
 
 FORMATS = ("auto", "jsonl", "csv", "lines", "chunks")
 FILTER_OPS = (">=", "<=", "==")
@@ -246,7 +254,12 @@ def _lines(text: str) -> Iterator[str]:
 
 
 def _own_id(value: Any, fallback: int) -> Any:
-    return value["id"] if isinstance(value, dict) and "id" in value else fallback
+    """The item's own id, or its number when it has none or one that no JSON response can hold.
+
+    MCP reads requests with pydantic_core.from_json, which turns NaN and the infinities into floats.
+    """
+    own = value["id"] if isinstance(value, dict) and "id" in value else fallback
+    return fallback if isinstance(own, float) and not math.isfinite(own) else own
 
 
 def _as_state(value: Any) -> Any:
@@ -260,13 +273,16 @@ def _jsonl_items(text: str, field: str | None) -> Iterator[Item]:
         if not line.strip():
             continue
         try:
-            value = json.loads(line)
+            # The hooks of the REST body parser: an id of NaN would make the response unwritable.
+            value = json.loads(line, parse_constant=refuse_constant, parse_float=finite_float)
         except RecursionError as exc:
             raise invalid(
                 f"line {line_no} is not valid JSON: it is nested too deeply", JSONL_HINT
             ) from exc
         except json.JSONDecodeError as exc:
             raise invalid(f"line {line_no} is not valid JSON: {exc.msg}", JSONL_HINT) from exc
+        except NonFiniteNumber as exc:
+            raise invalid(f"line {line_no} is not valid JSON: {exc}", JSONL_HINT) from exc
         except ValueError as exc:
             raise invalid(
                 f"line {line_no} is not valid JSON: a number has too many digits", JSONL_HINT
@@ -461,6 +477,10 @@ def public_record(record: dict[str, Any], *, include_warnings: bool = False) -> 
     return out
 
 
+# Exactly the names write_results gives its files: a UTC time, then 4 random bytes in lowercase hex.
+RESULT_NAME = re.compile(r"[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}\.jsonl")
+
+
 def write_results(results_dir: Path, records: list[dict[str, Any]]) -> Path:
     results_dir.mkdir(parents=True, exist_ok=True)
     path = results_dir / f"{datetime.now(UTC):%Y%m%dT%H%M%SZ}-{secrets.token_hex(4)}.jsonl"
@@ -479,11 +499,18 @@ def write_results(results_dir: Path, records: list[dict[str, Any]]) -> Path:
 def cleanup_results(
     results_dir: Path, *, max_age_seconds: float = RESULT_MAX_AGE_SECONDS, now: float | None = None
 ) -> int:
+    """Delete the result files older than max_age_seconds; return how many went.
+
+    results_dir may point at a folder that also holds the user's own files, so only names that
+    write_results gives are deleted.
+    """
     if not results_dir.exists():
         return 0
     cutoff = (time.time() if now is None else now) - max_age_seconds
     removed = 0
     for path in results_dir.glob("*.jsonl"):
+        if not RESULT_NAME.fullmatch(path.name):
+            continue
         try:
             if path.stat().st_mtime < cutoff:
                 path.unlink()

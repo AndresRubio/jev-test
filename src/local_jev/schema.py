@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -194,3 +195,24 @@ def _non_empty(value: Any) -> bool:
     if isinstance(value, str):
         return bool(value.strip())
     return isinstance(value, (dict, list)) and bool(value)
+
+
+# Hooks for json.loads, for REST bodies and the lines of a JSONL batch file.
+
+
+class NonFiniteNumber(ValueError):
+    """A number no response can hold: NaN, an infinity, or a literal that overflows to one."""
+
+
+def refuse_constant(name: str) -> Any:
+    """NaN and the infinities are not JSON. json.loads reads them, but no response can hold them."""
+    raise NonFiniteNumber(f"{name} is not allowed")
+
+
+def finite_float(text: str) -> float:
+    """float(text), refusing a literal such as 1e400 that overflows to an infinity."""
+    number = float(text)
+    if not math.isfinite(number):
+        shown = text if len(text) <= 32 else f"{text[:29]}..."
+        raise NonFiniteNumber(f"the number {shown} is out of range")
+    return number

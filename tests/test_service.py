@@ -213,10 +213,12 @@ async def test_a_batch_past_its_deadline_is_504(settings):
 
 @pytest.mark.anyio
 async def test_start_prefetches_and_cleans_old_results(settings):
-    old = settings.results_dir / "old.jsonl"
+    old = settings.results_dir / "20261001T120000Z-0123abcd.jsonl"
+    own = settings.results_dir / "my-export.jsonl"
     old.parent.mkdir(parents=True)
-    old.write_text("{}\n")
-    os.utime(old, (time.time() - 8 * 24 * 3600,) * 2)
+    for path in (old, own):
+        path.write_text("{}\n")
+        os.utime(path, (time.time() - 8 * 24 * 3600,) * 2)
     engine = FakeEngine()
     service = make(settings, engine, laya=dataclasses.replace(settings.laya, prefetch=("english",)))
     await service.start()
@@ -224,6 +226,7 @@ async def test_start_prefetches_and_cleans_old_results(settings):
     await service.stop()
     assert engine.prefetched == ["english"]
     assert not old.exists()
+    assert own.exists()
 
 
 def test_status_reports_engine_runtime_and_config(settings):

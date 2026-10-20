@@ -142,6 +142,37 @@ async def test_decide_batch_over_inline_items(service):
     assert [match["id"] for match in result.structured_content["matches"]] == [2]
 
 
+class RecordingService:
+    """Stands in for DecisionService and keeps every body decide_batch is given."""
+
+    def __init__(self):
+        self.calls = []
+
+    async def decide_batch(self, body, *, interface):
+        self.calls.append((body, interface))
+        return {"count": 0}
+
+
+@pytest.mark.anyio
+async def test_decide_batch_hands_every_parameter_to_the_service():
+    service = RecordingService()
+    arguments = {
+        "questions": Q,
+        "path": "/Users/someone/items.jsonl",
+        "items": ["billing issue", {"id": "x9", "text": "tech issue"}],
+        "format": "jsonl",
+        "field": "body.text",
+        "chunk_tokens": 128,
+        "filter": {"question": "dept", "op": "==", "value": "tech"},
+        "top_k": 5,
+        "model": "english",
+    }
+    async with Client(build_mcp_server(service)) as client:
+        result = await client.call_tool("decide_batch", arguments)
+    assert result.is_error is False
+    assert service.calls == [(arguments, "mcp")]
+
+
 @pytest.mark.anyio
 async def test_the_status_tool(service):
     async with Client(build_mcp_server(service)) as client:
