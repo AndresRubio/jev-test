@@ -28,6 +28,7 @@ DEPT = {
         },
     }
 }
+UPGRADE = "I would like to upgrade to the premium plan. What does it cost?"
 
 
 @pytest.fixture(scope="module")
@@ -56,6 +57,15 @@ def test_spanish_goes_to_the_multilingual_checkpoint(engine):
     assert result.answers["dept"]["choice"] == "billing"
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="the english checkpoint answers billing 0.6868 (sales 0.255, technical 0.0582)",
+)
+def test_an_upgrade_question_goes_to_sales(engine):
+    result = engine.decide(UPGRADE, DEPT, "auto")
+    assert result.answers["dept"]["choice"] == "sales"
+
+
 def test_a_long_state_reports_truncation(engine):
     questions = {"q": {"type": "noul", "instructions": "Does the text mention a refund?"}}
     result = engine.decide("filler words " * 600 + "please refund me", questions, "english")
@@ -81,6 +91,11 @@ async def test_rest_and_mcp_with_the_real_model(settings):
     port = free_port()
     settings = dataclasses.replace(settings, port=port, laya=LayaSettings(prefetch=("english",)))
     app = create_app(settings, service=DecisionService(settings, LayaMLXEngine(settings.laya)))
+    items = [
+        "I was billed twice, please refund one.",
+        "The app crashes with an error every time I open it.",
+        UPGRADE,
+    ]
     with serving(app, port) as base:
         async with httpx2.AsyncClient(timeout=60) as http:
             for _ in range(120):
@@ -90,10 +105,33 @@ async def test_rest_and_mcp_with_the_real_model(settings):
                 await asyncio.sleep(0.5)
             rest = await http.post(f"{base}/v1/systemone", json=JEV_DOC_EXAMPLE)
         async with Client(f"{base}/mcp") as client:
+            names = {tool.name for tool in (await client.list_tools()).tools}
             result = await client.call_tool(
                 "decide", {"state": "I was billed twice, please refund one.", "questions": DEPT}
             )
+            batch = await client.call_tool("decide_batch", {"questions": DEPT, "items": items})
+            mcp_status = await client.call_tool("status", {})
     assert rest.status_code == 200
-    assert set(rest.json()["answers"]) == {"dept", "refund", "urgency"}
+    body = rest.json()
+    assert set(body) == {"model", "answers", "usage", "local"}
+    answers = body["answers"]
+    assert set(answers) == {"dept", "refund", "urgency"}
+    assert {"type", "choice", "probabilities", "confidence"} <= set(answers["dept"])
+    assert answers["dept"]["choice"] == "billing"
+    assert {"type", "noul"} <= set(answers["refund"])
+    assert answers["urgency"]["legend"] == {"0": "not urgent", "1": "soon", "2": "blocking"}
+    assert all("answer_confidence" in answer for answer in answers.values())
+    assert set(body["usage"]) == {"input_tokens", "output_tokens"}
+    assert body["local"]["warnings"] == []
+    assert names == {"decide", "decide_batch", "status"}
     assert result.is_error is False
     assert result.structured_content["answers"]["dept"]["choice"] == "billing"
+    assert batch.is_error is False
+    assert batch.structured_content["count"] == 3
+    choices = [match["answers"]["dept"]["choice"] for match in batch.structured_content["matches"]]
+    assert choices[:2] == ["billing", "technical"]
+    # The upgrade item is a known miss; test_an_upgrade_question_goes_to_sales pins its label.
+    assert choices[2] in DEPT["dept"]["criteria"]
+    assert mcp_status.is_error is False
+    assert mcp_status.structured_content["backend"] == "laya-mlx"
+    assert "english" in mcp_status.structured_content["engine"]["loaded"]
