@@ -31,7 +31,7 @@ local-jev pull
 local-jev serve
 ```
 
-`serve` runs in the foreground on http://127.0.0.1:7711. `--port` picks another port.
+`serve` runs in the foreground on http://127.0.0.1:7711. To use another port, set `port` in the config file or `LOCAL_JEV_PORT`, because `status`, `connect`, `decide` and `batch` take the port from there; `serve --port` moves only the server.
 
 ```bash
 local-jev install-agent
@@ -45,7 +45,7 @@ local-jev status
 
 `status` prints what the running server is doing, or says that it is not running.
 
-The server listens only on 127.0.0.1. It answers only requests addressed to 127.0.0.1, localhost or [::1] on its own port, and it refuses requests that web pages send from any other origin. Models load on first use and unload after 15 idle minutes.
+The server listens only on 127.0.0.1. It answers only requests addressed to 127.0.0.1, localhost or [::1] on its own port, and it refuses requests from web pages unless the page itself comes from 127.0.0.1, localhost or [::1] over plain http, on any port. Models load on first use and unload after 15 idle minutes.
 
 ## Connect an agent
 
@@ -82,7 +82,7 @@ Differences from Jev:
 
 On that Mac one short question takes about 23 ms end to end over HTTP, and 10 questions in one call about 110 ms. The first request, which loads the English checkpoint, takes under a second. The process's footprint, as `top` reports it, is about 2,400 MB with both checkpoints loaded and under 300 MB after the idle unload.
 
-`decide_batch` gets through about 45 short items per second with one yes/no question, about 29 with two questions and about 8 when each item is about 430 tokens long. A batch has 300 seconds (`batch.timeout_seconds`) for all of its model calls, so it fits about 2,400 of those long items; split a larger file. A batch that runs out of time fails with a `timeout` error (a 504 over REST) that says how many items were done, and it writes no results file.
+`decide_batch` gets through about 45 short items per second with one yes/no question, about 29 with two questions and about 8 when each item is about 430 tokens long. A batch has 300 seconds (`batch.timeout_seconds`) for all of its model calls, and the time it spends waiting behind other requests counts too, so split files of more than about 2,000 of those long items. A batch that runs out of time fails with a `timeout` error (a 504 over REST) that says how many items were done, and it writes no results file.
 
 In the evaluation the model answered 22 of the 30 yes/no questions correctly with its own true/false labels and 24 with neutral A/B labels, so `ab_labels` is the default. It got 16 of the 20 choice questions right, and 7 of the 10 score questions when its most likely level counts as the answer.
 
@@ -91,7 +91,8 @@ Laya is a small encoder (322M to 421M parameters), and it has limits:
 - It is good at simple classification and yes/no reading, and weak at nuanced judgement unless it is fine-tuned on your own decisions.
 - Its probabilities are over-confident. Use them to rank answers, and remember that confidence is not permission.
 - The English checkpoint keeps about 320 to 480 tokens of the state, depending on how long the question and its options are, and the multilingual one about 760 to 990. An answer carries a `state_truncated` warning when the state was cut.
-- Negations ("don't cancel") are weak. The model got only 5 of the 10 negation items right with true/false labels and 8 of 10 with A/B labels, and some misses in both modes had a P(yes) above 0.9. Phrase questions positively.
+- Negations in the text ("don't cancel") are a weak spot. Every negation item in the evaluation has its negation in the text, and the model got only 5 of those 10 right with true/false labels and 8 of 10 with A/B labels; some misses in both modes had a P(yes) above 0.9.
+- Phrase questions positively; the tool descriptions ask agents to do the same.
 - The model rated all three "not urgent" items of the urgency rubric one or two levels too urgent.
 - Quality drops with more than about 20 options, so local-jev narrows a larger choice in elimination rounds. It splits the options into groups of at most 20, sends each group's winner on, and asks the final question over the finalists. That answer has `shortlisted: {"kept": [...], "dropped": n}` and a `shortlisted` warning, and its probabilities cover only the finalists. A round that cuts the state or merges options adds the same `state_truncated` or `options_collapsed` warning as an ordinary question.
 - On the English checkpoint, treat the probabilities of a choice with 11 to 20 options as uncalibrated. The checkpoint ships a temperature of 0.1006 for that size. laya-mlx raises it to 0.5 and prints a `RuntimeWarning` when it loads the checkpoint, but 0.5 still doubles the logits. A narrowed choice is affected only when 11 or more finalists reach the final question, which takes more than 200 options.
@@ -117,7 +118,7 @@ prefetch = ["english", "multilingual"]
 allowed_roots = ["~"]           # folders decide_batch may read
 
 [remote]
-url = ""                        # the full URL, e.g. "http://127.0.0.1:8009/v1/systemone"
+url = ""                        # e.g. "http://127.0.0.1:8009/v1/systemone" for a Kev server
 api_key_env = ""                # the environment variable that holds the remote API key
 ```
 
