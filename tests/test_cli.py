@@ -454,6 +454,13 @@ def test_logging_goes_only_to_the_server_log_when_stderr_is_not_a_terminal(monke
         assert Path(file_handler.baseFilename) == tmp_path / "logs" / "server.log"
 
 
+def test_logging_goes_only_to_the_server_log_when_there_is_no_stderr(monkeypatch, tmp_path):
+    # Python sets sys.stderr to None when serve starts with its stderr closed.
+    with logging_handlers(monkeypatch, tmp_path, None) as handlers:
+        [file_handler] = handlers
+        assert Path(file_handler.baseFilename) == tmp_path / "logs" / "server.log"
+
+
 # the agent
 
 

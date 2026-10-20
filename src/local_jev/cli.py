@@ -368,6 +368,7 @@ def _configure_logging(log_dir: Path) -> None:
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
     handlers: list[logging.Handler] = [handler]
     # Under launchd stderr is launchd.err.log, which never rotates, so only a terminal gets a copy.
-    if sys.stderr.isatty():
+    # sys.stderr is None when the process started with its stderr closed.
+    if sys.stderr is not None and sys.stderr.isatty():
         handlers.append(logging.StreamHandler())
     logging.basicConfig(level=logging.INFO, handlers=handlers)
