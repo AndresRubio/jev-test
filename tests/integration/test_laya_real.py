@@ -1,4 +1,8 @@
-"""Real-weights checks. Run `uv run local-jev pull` first, then `uv run pytest -m integration -v`."""
+"""Real-weights checks: `uv run pytest -m integration -v`.
+
+They need the real Laya weights (about 1.5 GB), downloaded on first run: the module fixture fetches
+and verifies the English and multilingual checkpoints when they are missing, as `local-jev pull` does.
+"""
 
 import asyncio
 import dataclasses
