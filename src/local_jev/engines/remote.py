@@ -39,10 +39,20 @@ class RemoteJevEngine:
     ) -> None:
         self._url = url
         self._api_key = api_key
+        target = httpx2.URL(url)
         # With trust_env, a proxy from the environment or the system settings gets every state
         # and the API key, in clear text over http. A server on this Mac needs no proxy.
-        trust_env = not _is_loopback(httpx2.URL(url).host)
-        self._client = httpx2.Client(timeout=timeout, transport=transport, trust_env=trust_env)
+        trust_env = not _is_loopback(target.host)
+        # trust_env also makes httpx2 read SSL_CERT_FILE and SSL_CERT_DIR, which an https server
+        # on this Mac with its own certificate needs, so its context still reads them.
+        verify = (
+            httpx2.create_ssl_context(trust_env=True)
+            if not trust_env and target.scheme == "https"
+            else True
+        )
+        self._client = httpx2.Client(
+            timeout=timeout, transport=transport, trust_env=trust_env, verify=verify
+        )
 
     def decide(self, state: Any, questions: dict[str, dict[str, Any]], model: str) -> EngineResult:
         payload = {

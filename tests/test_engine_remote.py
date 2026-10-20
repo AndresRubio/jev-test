@@ -1,10 +1,17 @@
+import ipaddress
 import json
+import ssl
 import threading
 from contextlib import contextmanager
+from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import httpx2
 import pytest
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.x509.oid import NameOID
 
 from local_jev.engines.remote import ENDPOINT_HINT, RemoteJevEngine
 from local_jev.errors import ModelUnavailable
@@ -153,11 +160,11 @@ def test_status_and_repr_never_show_the_api_key():
 
 
 @contextmanager
-def recording_server():
-    """A server on 127.0.0.1 that answers every POST with ANSWER.
+def recording_server(certificate=None):
+    """A server on 127.0.0.1 that answers every POST with ANSWER, over https with a certificate.
 
     Yields its port and the (request line, Authorization) pairs it saw. A proxy sees the full URL
-    in the request line.
+    in the request line. certificate is a (certificate file, key file) pair.
     """
     seen = []
     reply = json.dumps(ANSWER).encode()
@@ -176,6 +183,10 @@ def recording_server():
             pass
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    if certificate is not None:
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(*certificate)
+        server.socket = context.wrap_socket(server.socket, server_side=True)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
@@ -232,3 +243,60 @@ def test_the_environment_is_ignored_only_for_a_loopback_host(host, loopback):
     # 127.0.0.0/8, ::1 and localhost; the two tests above send real requests for two of them.
     engine = RemoteJevEngine(f"http://{host}:8009/v1/systemone")
     assert engine._client.trust_env is not loopback
+
+
+@pytest.fixture
+def loopback_certificate(tmp_path):
+    """A self-signed certificate for 127.0.0.1 and its key, as two PEM files."""
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "127.0.0.1")])
+    now = datetime.now(UTC)
+    certificate = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - timedelta(minutes=5))
+        .not_valid_after(now + timedelta(days=1))
+        .add_extension(
+            x509.SubjectAlternativeName([x509.IPAddress(ipaddress.ip_address("127.0.0.1"))]),
+            critical=False,
+        )
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .sign(key, hashes.SHA256())
+    )
+    cert_file, key_file = tmp_path / "cert.pem", tmp_path / "key.pem"
+    cert_file.write_bytes(certificate.public_bytes(serialization.Encoding.PEM))
+    key_file.write_bytes(
+        key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+    )
+    return cert_file, key_file
+
+
+def test_a_loopback_https_backend_is_trusted_through_ssl_cert_file(
+    monkeypatch, loopback_certificate
+):
+    # Ignoring the environment's proxies for a loopback host must not also drop SSL_CERT_FILE,
+    # which a local server with its own certificate needs.
+    monkeypatch.setenv("SSL_CERT_FILE", str(loopback_certificate[0]))
+    with recording_server(loopback_certificate) as (port, seen):
+        engine = RemoteJevEngine(f"https://127.0.0.1:{port}/v1/systemone", api_key=SECRET)
+        assert engine.decide("x", QUESTIONS, "auto").answers == ANSWER["answers"]
+    assert seen == [("POST /v1/systemone HTTP/1.1", f"Bearer {SECRET}")]
+
+
+def test_a_loopback_https_backend_with_an_untrusted_certificate_is_refused(
+    monkeypatch, loopback_certificate
+):
+    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+    monkeypatch.delenv("SSL_CERT_DIR", raising=False)
+    with recording_server(loopback_certificate) as (port, seen):
+        engine = RemoteJevEngine(f"https://127.0.0.1:{port}/v1/systemone", api_key=SECRET)
+        with pytest.raises(ModelUnavailable, match="unreachable"):
+            engine.decide("x", QUESTIONS, "auto")
+    assert seen == []
