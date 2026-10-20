@@ -6,6 +6,7 @@ import time
 
 import pytest
 
+from local_jev import batch
 from local_jev.batch import (
     Filter,
     aggregate_warnings,
@@ -21,6 +22,7 @@ from local_jev.batch import (
     write_results,
 )
 from local_jev.errors import ServiceError
+from local_jev.schema import parse_state
 
 NOUL = {"type": "noul", "instructions": "Is it relevant?"}
 CHOICE = {"type": "choice", "instructions": "Which team?", "criteria": ["billing", "tech"]}
@@ -467,3 +469,211 @@ def test_only_the_bytes_counted_when_the_file_was_opened_are_read(tmp_path, monk
     monkeypatch.setattr(os, "fstat", fstat_before_growth)
     items = load_items(params(path=str(path)), path=path, count_tokens=words, max_items=5)
     assert [item.state for item in items] == ["one", "two"]
+
+
+# Line separators, byte order marks, the item limit, the format of a symlink and inline items.
+
+BOM = b"\xef\xbb\xbf"
+OTHER_SEPARATORS = ["\x0b", "\x0c", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029"]
+
+
+@pytest.mark.parametrize("separator", ["\x85", "\u2028", "\u2029"], ids=["nel", "ls", "ps"])
+def test_a_jsonl_string_may_hold_a_raw_unicode_line_separator(tmp_path, separator):
+    path = tmp_path / "items.jsonl"
+    path.write_text(
+        f'{{"id": "a", "text": "one{separator}two"}}\n{{"text": "three"}}\n', encoding="utf-8"
+    )
+    items = load_items(
+        params(path=str(path), field="text"), path=path, count_tokens=words, max_items=5
+    )
+    assert [(item.id, item.n, item.state) for item in items] == [
+        ("a", 1, f"one{separator}two"),
+        (2, 2, "three"),
+    ]
+
+
+def test_a_form_feed_does_not_shift_line_numbers(tmp_path):
+    path = tmp_path / "pages.txt"
+    path.write_text("page one\n\fpage two\nlast\n")
+    lines = load_items(params(path=str(path)), path=path, count_tokens=words, max_items=5)
+    assert [(item.id, item.state) for item in lines] == [
+        (1, "page one"),
+        (2, "\fpage two"),
+        (3, "last"),
+    ]
+    chunks = load_items(
+        params(path=str(path), format="chunks"), path=path, count_tokens=words, max_items=5
+    )
+    assert [(item.start_line, item.end_line, item.state) for item in chunks] == [
+        (1, 3, "page one\n\fpage two\nlast")
+    ]
+
+
+@pytest.mark.parametrize("separator", OTHER_SEPARATORS, ids=repr)
+def test_only_a_newline_ends_a_line(tmp_path, separator):
+    path = tmp_path / "items.txt"
+    path.write_text(f"one{separator}still one\ntwo\nthree\n", encoding="utf-8")
+    lines = load_items(params(path=str(path)), path=path, count_tokens=words, max_items=5)
+    assert [(item.id, item.state) for item in lines] == [
+        (1, f"one{separator}still one"),
+        (2, "two"),
+        (3, "three"),
+    ]
+    chunks = load_items(
+        params(path=str(path), format="chunks"), path=path, count_tokens=words, max_items=5
+    )
+    assert [(item.start_line, item.end_line) for item in chunks] == [(1, 3)]
+
+
+def test_a_leading_byte_order_mark_is_dropped_from_csv(tmp_path):
+    path = tmp_path / "items.csv"
+    path.write_bytes(BOM + b"text,id\nhello,r1\n")
+    by_column = load_items(
+        params(path=str(path), field="text"), path=path, count_tokens=words, max_items=5
+    )
+    assert [(item.id, item.state) for item in by_column] == [("r1", "hello")]
+    whole_row = load_items(params(path=str(path)), path=path, count_tokens=words, max_items=5)
+    assert [(item.id, item.state) for item in whole_row] == [("r1", {"text": "hello", "id": "r1"})]
+
+
+@pytest.mark.parametrize(
+    ("name", "content", "extra", "expected"),
+    [
+        ("items.jsonl", b'{"id": "a", "text": "hi"}\n', {}, [("a", {"id": "a", "text": "hi"})]),
+        ("items.txt", b"one\ntwo\n", {}, [(1, "one"), (2, "two")]),
+        ("doc.md", b"one\ntwo\n", {"format": "chunks"}, [("1-2", "one\ntwo")]),
+    ],
+    ids=["jsonl", "lines", "chunks"],
+)
+def test_a_leading_byte_order_mark_is_dropped_from_the_other_formats(
+    tmp_path, name, content, extra, expected
+):
+    path = tmp_path / name
+    path.write_bytes(BOM + content)
+    items = load_items(params(path=str(path), **extra), path=path, count_tokens=words, max_items=5)
+    assert [(item.id, item.state) for item in items] == expected
+
+
+def test_a_cut_off_byte_order_mark_still_gives_a_replacement_character(tmp_path):
+    # The utf-8-sig codec would drop these bytes without a trace.
+    for name, content in (("one.txt", b"\xef"), ("two.txt", b"\xef\xbb")):
+        path = tmp_path / name
+        path.write_bytes(content)
+        items = load_items(params(path=str(path)), path=path, count_tokens=words, max_items=5)
+        assert [item.state for item in items] == ["\ufffd"], name
+
+
+def test_only_a_leading_byte_order_mark_is_dropped(tmp_path):
+    path = tmp_path / "items.txt"
+    path.write_bytes(BOM + b"one\n" + BOM + b"two\n")
+    items = load_items(params(path=str(path)), path=path, count_tokens=words, max_items=5)
+    assert [item.state for item in items] == ["one", "\ufefftwo"]
+
+
+def large_file(tmp_path, fmt):
+    rows = [f"row {i}" for i in range(1000)]
+    if fmt == "jsonl":
+        name, text = "items.jsonl", "".join(f'{{"text": "{row}"}}\n' for row in rows)
+    elif fmt == "csv":
+        name, text = "items.csv", "text\n" + "".join(f"{row}\n" for row in rows)
+    else:
+        name, text = "items.txt", "".join(f"{row}\n" for row in rows)
+    path = tmp_path / name
+    path.write_text(text)
+    return path
+
+
+@pytest.mark.parametrize("fmt", ["jsonl", "csv", "lines", "chunks"])
+def test_a_reader_stops_one_item_past_the_limit(tmp_path, monkeypatch, fmt):
+    path = large_file(tmp_path, fmt)
+    built, tokenized = [], []
+    real_item = batch.Item
+
+    def counting_item(**fields):
+        built.append(fields)
+        return real_item(**fields)
+
+    def counting_tokens(text):
+        tokenized.append(text)
+        return words(text)
+
+    monkeypatch.setattr(batch, "Item", counting_item)
+    with pytest.raises(ServiceError) as info:
+        load_items(
+            params(path=str(path), format=fmt, chunk_tokens=32),
+            path=path,
+            count_tokens=counting_tokens,
+            max_items=5,
+        )
+    assert (info.value.status, info.value.code) == (413, "too_large")
+    assert info.value.message == f"{path} has more than 5 items; the limit is 5"
+    assert info.value.hint == "split the file"
+    assert len(built) == 6
+    assert len(tokenized) <= 100  # chunks: the sixth chunk is complete once line 97 is read
+
+
+def test_a_file_with_exactly_the_limit_loads(tmp_path):
+    path = tmp_path / "five.txt"
+    path.write_text("a\nb\nc\nd\ne\n")
+    items = load_items(params(path=str(path)), path=path, count_tokens=words, max_items=5)
+    assert len(items) == 5
+
+
+@pytest.mark.parametrize(
+    ("link_name", "real_name", "extra", "states"),
+    [
+        ("data.jsonl", "export", {"field": "text"}, ["a", "b"]),
+        ("notes.txt", "export.jsonl", {}, ['{"text": "a"}', '{"text": "b"}']),
+    ],
+    ids=["jsonl link to a bare file", "txt link to a jsonl file"],
+)
+def test_auto_picks_the_format_from_the_name_the_caller_gave(
+    tmp_path, link_name, real_name, extra, states
+):
+    real = tmp_path / real_name
+    real.write_text('{"text": "a"}\n{"text": "b"}\n')
+    link = tmp_path / link_name
+    os.symlink(real, link)
+    # FilePolicy.check hands load_items the resolved file; the params keep the path that was named.
+    items = load_items(
+        params(path=str(link), **extra), path=real.resolve(), count_tokens=words, max_items=5
+    )
+    assert [item.state for item in items] == states
+
+
+@pytest.mark.parametrize(
+    ("items", "n", "bad", "status"),
+    [
+        (["ok", None], 2, None, 422),
+        ([5], 1, 5, 422),
+        ([True], 1, True, 422),
+        (["ok", "ok", ""], 3, "", 422),
+        (["ok", "   "], 2, "   ", 422),
+        (["ok", "x" * 200_001], 2, "x" * 200_001, 413),
+    ],
+    ids=["null", "number", "boolean", "empty", "blank", "too long"],
+)
+def test_inline_items_are_checked_like_a_single_state(items, n, bad, status):
+    with pytest.raises(ServiceError) as single:
+        parse_state(bad)
+    with pytest.raises(ServiceError) as info:
+        load_items(params(items=items), path=None, count_tokens=words, max_items=5)
+    assert info.value.status == single.value.status == status
+    assert info.value.code == single.value.code
+    assert info.value.hint == single.value.hint
+    assert info.value.message == f"item {n}: {single.value.message}"
+
+
+def test_valid_inline_items_are_returned_as_they_were_sent():
+    sent = ["text", {"id": "x", "a": 1}, ["l", "m"], {}]
+    items = load_items(params(items=sent), path=None, count_tokens=words, max_items=5)
+    assert [item.state for item in items] == sent
+
+
+def test_inline_items_over_the_limit_are_refused_before_any_is_checked():
+    body = {"questions": {"relevant": NOUL}, "items": [None, None, None]}
+    over = parse_batch_params(body, max_items=10)
+    with pytest.raises(ServiceError) as info:
+        load_items(over, path=None, count_tokens=words, max_items=2)
+    assert info.value.status == 413
+    assert info.value.message == "3 items; the limit is 2"

@@ -10,15 +10,16 @@ import os
 import secrets
 import stat
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from itertools import islice
 from pathlib import Path
 from typing import Any
 
-from local_jev.errors import invalid, too_large
+from local_jev.errors import ServiceError, invalid, too_large
 from local_jev.guard import compact_answers, warning_code
-from local_jev.schema import parse_model, parse_questions
+from local_jev.schema import parse_model, parse_questions, parse_state
 
 FORMATS = ("auto", "jsonl", "csv", "lines", "chunks")
 FILTER_OPS = (">=", "<=", "==")
@@ -146,33 +147,50 @@ def load_items(
     params: BatchParams, *, path: Path | None, count_tokens: Callable[[str], int], max_items: int
 ) -> list[Item]:
     if params.items is not None:
-        return [
-            Item(id=_own_id(state, n), n=n, state=state)
-            for n, state in enumerate(params.items, start=1)
-        ]
+        return _inline_items(params.items, max_items)
     if path is None:
         raise invalid("'path' was not checked", "this is a bug; please report it")
     text = _read_text(path)
-    fmt = resolve_format(params.format, path)
+    # auto goes by the name the caller gave; path is the resolved file and may be named otherwise.
+    fmt = resolve_format(params.format, Path(params.path) if params.path else path)
     if fmt == "jsonl":
-        items = _jsonl_items(text, params.field)
+        found = _jsonl_items(text, params.field)
     elif fmt == "csv":
-        items = _csv_items(text, params.field)
+        found = _csv_items(text, params.field)
     elif fmt == "lines":
-        items = [
+        found = (
             Item(id=n, n=n, state=line)
-            for n, line in enumerate(text.splitlines(), start=1)
+            for n, line in enumerate(_lines(text), start=1)
             if line.strip()
-        ]
+        )
     else:
-        items = _chunk_items(text, params.chunk_tokens, count_tokens)
+        found = _chunk_items(text, params.chunk_tokens, count_tokens)
+    # The readers are lazy, so one item past the limit is as far as any of them goes.
+    items = list(islice(found, max_items + 1))
     if not items:
         raise invalid(f"{path} has no items", "check the format and that the file is not empty")
     if len(items) > max_items:
         raise too_large(
-            f"{path} has {len(items)} items; the limit is {max_items}", "split the file"
+            f"{path} has more than {max_items} items; the limit is {max_items}", "split the file"
         )
     return items
+
+
+def _inline_items(items: list[Any], max_items: int) -> list[Item]:
+    if len(items) > max_items:
+        raise too_large(f"{len(items)} items; the limit is {max_items}", "split the batch")
+    return [
+        Item(id=_own_id(state, n), n=n, state=_checked_state(n, state))
+        for n, state in enumerate(items, start=1)
+    ]
+
+
+def _checked_state(n: int, state: Any) -> Any:
+    """The item if it is a valid state, as for a single decide; else that error, naming the item."""
+    try:
+        return parse_state(state)
+    except ServiceError as exc:
+        raise ServiceError(exc.status, exc.code, f"item {n}: {exc.message}", exc.hint) from exc
 
 
 def _read_text(path: Path) -> str:
@@ -204,7 +222,27 @@ def _read_text(path: Path) -> str:
             f"{path} could not be read: {exc.strerror or type(exc).__name__}", READ_HINT
         ) from exc
     # The wrapper is what Path.read_text uses: bad bytes become U+FFFD and \r\n and \r become \n.
-    return io.TextIOWrapper(io.BytesIO(b"".join(chunks)), encoding="utf-8", errors="replace").read()
+    # A leading byte order mark, which Excel's CSV UTF-8 writes, is dropped from the text. The
+    # utf-8-sig codec would do the same but loses a file that is only half a mark, with no U+FFFD.
+    raw = io.BytesIO(b"".join(chunks))
+    return io.TextIOWrapper(raw, encoding="utf-8", errors="replace").read().removeprefix("\ufeff")
+
+
+def _lines(text: str) -> Iterator[str]:
+    """The lines of the text, ended by a newline and by nothing else.
+
+    str.splitlines also splits at form feeds, U+2028, U+0085 and a few more characters. That moves
+    line numbers away from what grep -n and an editor show, and cuts valid JSON strings in two.
+    By now every line ending is a newline. Like splitlines, a final newline starts no new line.
+    It is lazy, so a reader that stops early does not split the rest of the file.
+    """
+    start = 0
+    while start < len(text):
+        end = text.find("\n", start)
+        if end < 0:
+            end = len(text)
+        yield text[start:end]
+        start = end + 1
 
 
 def _own_id(value: Any, fallback: int) -> Any:
@@ -217,9 +255,8 @@ def _as_state(value: Any) -> Any:
     return json.dumps(value)
 
 
-def _jsonl_items(text: str, field: str | None) -> list[Item]:
-    items = []
-    for line_no, line in enumerate(text.splitlines(), start=1):
+def _jsonl_items(text: str, field: str | None) -> Iterator[Item]:
+    for line_no, line in enumerate(_lines(text), start=1):
         if not line.strip():
             continue
         try:
@@ -235,8 +272,7 @@ def _jsonl_items(text: str, field: str | None) -> list[Item]:
                 f"line {line_no} is not valid JSON: a number has too many digits", JSONL_HINT
             ) from exc
         state = _lookup(value, field, line_no) if field else value
-        items.append(Item(id=_own_id(value, line_no), n=line_no, state=_as_state(state)))
-    return items
+        yield Item(id=_own_id(value, line_no), n=line_no, state=_as_state(state))
 
 
 def _lookup(value: Any, dotted: str, line_no: int) -> Any:
@@ -247,7 +283,7 @@ def _lookup(value: Any, dotted: str, line_no: int) -> Any:
     return value
 
 
-def _csv_items(text: str, field: str | None) -> list[Item]:
+def _csv_items(text: str, field: str | None) -> Iterator[Item]:
     reader = csv.DictReader(io.StringIO(text))
     try:
         columns = reader.fieldnames or []
@@ -255,72 +291,73 @@ def _csv_items(text: str, field: str | None) -> list[Item]:
             raise invalid("the CSV file has no header row", "the first line must name the columns")
         if field is not None and field not in columns:
             raise invalid(f"column {field!r} not found", f"columns: {', '.join(columns)}")
-        items = []
         for n, row in enumerate(reader, start=1):
             state = (
                 row[field]
                 if field is not None
                 else {key: value for key, value in row.items() if key is not None}
             )
-            items.append(Item(id=row.get("id") or n, n=n, state=_as_state(state)))
+            yield Item(id=row.get("id") or n, n=n, state=_as_state(state))
     except csv.Error as exc:
         # Raised for a cell over the csv module's field size limit.
         hint = (
             f"close every quoted cell, and keep each cell under {csv.field_size_limit()} characters"
         )
         raise invalid(f"the CSV file could not be parsed: {exc}", hint) from exc
-    return items
 
 
-def _chunk_items(text: str, chunk_tokens: int, count_tokens: Callable[[str], int]) -> list[Item]:
-    items: list[Item] = []
+def _chunk_items(
+    text: str, chunk_tokens: int, count_tokens: Callable[[str], int]
+) -> Iterator[Item]:
     buffer: list[str] = []
     buffer_tokens = 0
     start: int | None = None
+    built = 0
 
-    def flush(end_line: int) -> None:
-        nonlocal buffer, buffer_tokens, start
+    def flush(end_line: int) -> list[Item]:
+        nonlocal buffer, buffer_tokens, start, built
         body = "\n".join(buffer)
+        chunks = []
         if body.strip() and start is not None:
-            items.append(
+            built += 1
+            chunks.append(
                 Item(
                     id=f"{start}-{end_line}",
-                    n=len(items) + 1,
+                    n=built,
                     state=body,
                     start_line=start,
                     end_line=end_line,
                 )
             )
         buffer, buffer_tokens, start = [], 0, None
+        return chunks
 
-    lines = text.splitlines()
-    for line_no, line in enumerate(lines, start=1):
+    line_no = 0
+    for line_no, line in enumerate(_lines(text), start=1):
         tokens = count_tokens(line) if line.strip() else 0
         if tokens > chunk_tokens:
-            flush(line_no - 1)
+            yield from flush(line_no - 1)
             pieces = math.ceil(tokens / chunk_tokens)
             size = math.ceil(len(line) / pieces)
             for index in range(pieces):
                 piece = line[index * size : (index + 1) * size]
                 if piece.strip():
-                    items.append(
-                        Item(
-                            id=f"{line_no}-{line_no}#{index + 1}",
-                            n=len(items) + 1,
-                            state=piece,
-                            start_line=line_no,
-                            end_line=line_no,
-                        )
+                    built += 1
+                    yield Item(
+                        id=f"{line_no}-{line_no}#{index + 1}",
+                        n=built,
+                        state=piece,
+                        start_line=line_no,
+                        end_line=line_no,
                     )
             continue
         if buffer and buffer_tokens + tokens > chunk_tokens:
-            flush(line_no - 1)
+            yield from flush(line_no - 1)
         if start is None:
             start = line_no
         buffer.append(line)
         buffer_tokens += tokens
-    flush(len(lines))
-    return items
+    yield from flush(line_no)
 
 
 def passes(flt: Filter | None, answers: dict[str, dict[str, Any]]) -> bool:
