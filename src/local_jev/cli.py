@@ -263,6 +263,9 @@ def cmd_uninstall_agent(args: argparse.Namespace) -> int:
 def _call(settings: Settings, method: str, path: str, payload: Any, *, timeout: float) -> int:
     url = f"http://127.0.0.1:{settings.port}{path}"
     headers = {"Authorization": f"Bearer {settings.token}"} if settings.token else {}
+    # load_settings already refuses a token that cannot go in a header, so main() never gets
+    # here with one. Both checks stay so that _call never prints the token whatever Settings it
+    # is given.
     if settings.token and not settings.token.isascii():
         # httpx2 cannot encode it as a header, and its error names the character that failed.
         print(BAD_TOKEN, file=sys.stderr)
