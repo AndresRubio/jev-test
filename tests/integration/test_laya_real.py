@@ -97,6 +97,7 @@ def test_spanish_goes_to_the_multilingual_checkpoint(engine):
 
 @pytest.mark.xfail(
     strict=True,
+    raises=AssertionError,
     reason="the english checkpoint answers billing 0.6868 (sales 0.255, technical 0.0582)",
 )
 def test_an_upgrade_question_goes_to_sales(engine):
