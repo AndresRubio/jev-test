@@ -17,11 +17,13 @@ from typing import Any
 import httpx2
 
 from local_jev import __version__, launchd
-from local_jev.config import ConfigError, Settings, load_settings
+from local_jev.config import ENV_VARS, PATH_ENV_VARS, ConfigError, Settings, load_settings
 
 NOT_RUNNING = (
     "local-jev is not running; start it with `local-jev serve` or `local-jev install-agent`"
 )
+BAD_TOKEN = "could not send the request: LOCAL_JEV_TOKEN is not a valid HTTP header value"
+HF_ENV_VARS = ("HF_HOME", "HF_HUB_CACHE")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -169,13 +171,13 @@ def cmd_status(args: argparse.Namespace, settings: Settings) -> int:
 def cmd_connect(args: argparse.Namespace, settings: Settings) -> int:
     url = f"http://127.0.0.1:{settings.port}/mcp"
     if args.harness == "claude-code":
-        argv = ["claude", "mcp", "add", "--transport", "http", "--scope", "user"]
+        # claude mcp add reads everything after --header as another header, so it goes last.
+        argv = ["claude", "mcp", "add", "--transport", "http", "--scope", "user", "local-jev", url]
         shown = " ".join(argv)
         if settings.token:
             argv += ["--header", f"Authorization: Bearer {settings.token}"]
             shown += ' --header "Authorization: Bearer $LOCAL_JEV_TOKEN"'
-        argv += ["local-jev", url]
-        print(f"{shown} local-jev {url}")
+        print(shown)
         if not args.apply:
             return 0
         if shutil.which("claude") is None:
@@ -207,17 +209,37 @@ def cmd_connect(args: argparse.Namespace, settings: Settings) -> int:
 
 def cmd_install_agent(args: argparse.Namespace, settings: Settings) -> int:
     program = _serve_command()
-    env = {"LOCAL_JEV_TOKEN": settings.token} if settings.token else {}
-    if os.environ.get("LOCAL_JEV_CONFIG"):
-        env["LOCAL_JEV_CONFIG"] = os.environ["LOCAL_JEV_CONFIG"]
+    env = _agent_environment()
+    log_dir = settings.log_dir.resolve()
     shown = {key: ("***" if key == "LOCAL_JEV_TOKEN" else value) for key, value in env.items()}
-    print(f"This writes {launchd.plist_path()} (mode 600) and loads it with launchctl:\n")
-    print(launchd.render_plist(program, settings.log_dir, shown).decode())
+    plist = launchd.plist_path()
+    print(f"This writes {plist} (mode 600) and loads it with launchctl:\n")
+    print(launchd.render_plist(program, log_dir, shown).decode())
     if not (args.yes or _confirm("Install and start the login agent?")):
         print("cancelled")
         return 1
-    path = launchd.install(program, settings.log_dir, env)
-    print(f"installed {path}; local-jev now starts at login (logs in {settings.log_dir})")
+    try:
+        path = launchd.install(program, log_dir, env)
+    except subprocess.CalledProcessError as exc:
+        # launchctl printed its own reason. The plist is on disk and the old agent is stopped.
+        print(
+            f"launchctl could not load the login agent (exit status {exc.returncode}).\n"
+            f"The plist is written at {plist}, so the agent will load at your next login."
+            " An agent that was running before has been stopped.\n"
+            f"To load it now: launchctl bootstrap gui/$UID {plist}\n"
+            "To remove it: local-jev uninstall-agent",
+            file=sys.stderr,
+        )
+        return 1
+    except OSError as exc:
+        # Raised while writing the plist or starting launchctl, both before anything was stopped.
+        print(
+            f"could not install the login agent: {exc}\n"
+            "the agent that is running now, if any, was left alone",
+            file=sys.stderr,
+        )
+        return 1
+    print(f"installed {path}; local-jev now starts at login (logs in {log_dir})")
     return 0
 
 
@@ -233,10 +255,18 @@ def cmd_uninstall_agent(args: argparse.Namespace, settings: Settings) -> int:
 def _call(settings: Settings, method: str, path: str, payload: Any, *, timeout: float) -> int:
     url = f"http://127.0.0.1:{settings.port}{path}"
     headers = {"Authorization": f"Bearer {settings.token}"} if settings.token else {}
+    if settings.token and not settings.token.isascii():
+        # httpx2 cannot encode it as a header, and its error names the character that failed.
+        print(BAD_TOKEN, file=sys.stderr)
+        return 1
     try:
         status, body = _request(method, url, payload=payload, headers=headers, timeout=timeout)
     except httpx2.ConnectError:
         print(NOT_RUNNING, file=sys.stderr)
+        return 1
+    except httpx2.LocalProtocolError:
+        # The error repeats the whole header value, and the header holds the token.
+        print(BAD_TOKEN, file=sys.stderr)
         return 1
     except httpx2.HTTPError as exc:
         print(f"request failed: {exc}", file=sys.stderr)
@@ -248,13 +278,37 @@ def _call(settings: Settings, method: str, path: str, payload: Any, *, timeout: 
 def _request(
     method: str, url: str, *, payload: Any, headers: dict[str, str], timeout: float
 ) -> tuple[int, Any]:
-    response = httpx2.request(method, url, json=payload, headers=headers, timeout=timeout)
+    # trust_env=False keeps the token and the body off any proxy named in the environment.
+    response = httpx2.request(
+        method, url, json=payload, headers=headers, timeout=timeout, trust_env=False
+    )
     try:
         return response.status_code, response.json()
     except ValueError:
         return response.status_code, {
             "error": {"code": "bad_response", "message": response.text[:500], "hint": ""}
         }
+
+
+def _agent_environment() -> dict[str, str]:
+    """The settings the login agent needs, copied from this environment.
+
+    launchd does not read the shell profile, so a setting made there would reach `status` and
+    `connect` but not the server. Paths are made absolute because the agent starts in `/`. Empty
+    values are skipped, as load_settings skips them.
+    """
+    env: dict[str, str] = {}
+    for name in (*ENV_VARS, *HF_ENV_VARS):
+        value = os.environ.get(name)
+        if not value:
+            continue
+        if name in PATH_ENV_VARS or name in HF_ENV_VARS:
+            value = os.path.expanduser(value)
+            if name in HF_ENV_VARS:
+                value = os.path.expandvars(value)  # huggingface_hub expands $VAR in these two
+            value = str(Path(value).resolve())
+        env[name] = value
+    return env
 
 
 def _read_state(path: Path) -> Any:

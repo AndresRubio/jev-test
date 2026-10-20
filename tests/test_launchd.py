@@ -1,6 +1,8 @@
+import errno
 import os
 import plistlib
 import stat
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -72,7 +74,6 @@ def test_render_plist_holds_exactly_the_keys_launchd_needs(tmp_path):
         "ProgramArguments": ["/bin/local-jev", "serve"],
         "RunAtLoad": True,
         "KeepAlive": True,
-        "ProcessType": "Background",
         "StandardOutPath": str(tmp_path / "launchd.out.log"),
         "StandardErrorPath": str(tmp_path / "launchd.err.log"),
         "EnvironmentVariables": {"LOCAL_JEV_TOKEN": "t"},
@@ -101,8 +102,9 @@ def test_install_makes_its_folders_and_tightens_a_looser_file(tmp_path):
 
 
 def test_the_plist_is_created_private_not_only_tightened_afterwards(monkeypatch, tmp_path):
-    # The file holds the token. With chmod disabled, the mode it was created with must already be 600.
+    # The file holds the token. With every chmod disabled, the mode it was created with must be 600.
     monkeypatch.setattr(Path, "chmod", lambda self, mode: None)
+    monkeypatch.setattr(os, "fchmod", lambda fd, mode: None)
     path = launchd.install(
         ["x"],
         tmp_path / "logs",
@@ -113,7 +115,7 @@ def test_the_plist_is_created_private_not_only_tightened_afterwards(monkeypatch,
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
 
-def test_install_boots_out_then_bootstraps_a_plist_that_is_already_written(tmp_path):
+def test_install_writes_the_plist_before_it_boots_the_old_agent_out(tmp_path):
     calls = []
     path = launchd.plist_path(tmp_path)
 
@@ -126,7 +128,7 @@ def test_install_boots_out_then_bootstraps_a_plist_that_is_already_written(tmp_p
         (
             ["launchctl", "bootout", f"{domain}/{LABEL}"],
             {"check": False, "capture_output": True},
-            False,
+            True,
         ),
         (["launchctl", "bootstrap", domain, str(path)], {"check": True}, True),
     ]
@@ -146,3 +148,113 @@ def test_uninstall_boots_the_agent_out_even_when_the_plist_is_gone(tmp_path):
         {"check": False, "capture_output": True},
     )
     assert calls == [bootout, bootout]
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can write into a read-only folder")
+def test_a_folder_that_cannot_be_written_stops_the_install_before_the_old_agent_is_booted_out(
+    tmp_path,
+):
+    path = launchd.plist_path(tmp_path)
+    path.parent.mkdir(parents=True)
+    path.parent.chmod(0o500)
+    calls = []
+    try:
+        with pytest.raises(PermissionError):
+            launchd.install(
+                ["x"],
+                tmp_path / "logs",
+                {},
+                home=tmp_path,
+                run=lambda argv, **kw: calls.append(argv),
+            )
+    finally:
+        path.parent.chmod(0o700)
+    assert calls == []
+    assert list(path.parent.iterdir()) == []
+
+
+def test_a_failed_replace_keeps_the_old_plist_removes_the_temporary_file_and_boots_nothing_out(
+    monkeypatch, tmp_path
+):
+    path = launchd.plist_path(tmp_path)
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"old plist")
+    calls = []
+
+    def disk_full(src, dst):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(os, "replace", disk_full)
+    with pytest.raises(OSError, match="No space left"):
+        launchd.install(
+            ["x"],
+            tmp_path / "logs",
+            {"LOCAL_JEV_TOKEN": "t"},
+            home=tmp_path,
+            run=lambda argv, **kw: calls.append(argv),
+        )
+    assert calls == []
+    assert path.read_bytes() == b"old plist"
+    assert [item.name for item in path.parent.iterdir()] == [path.name]
+
+
+def test_the_plist_replaces_the_old_one_in_one_step_from_a_private_complete_file(
+    monkeypatch, tmp_path
+):
+    seen = {}
+    real_replace = os.replace
+
+    def replace(src, dst):
+        seen.update(
+            src=Path(src),
+            dst=Path(dst),
+            mode=stat.S_IMODE(os.stat(src).st_mode),
+            label=plistlib.loads(Path(src).read_bytes())["Label"],
+        )
+        real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", replace)
+    path = launchd.install(
+        ["x"],
+        tmp_path / "logs",
+        {"LOCAL_JEV_TOKEN": "t"},
+        home=tmp_path,
+        run=lambda argv, **kw: None,
+    )
+    assert seen["dst"] == path
+    assert seen["src"].parent == path.parent
+    assert seen["src"] != path
+    assert seen["src"].suffix == ".tmp"  # launchd would load a leftover *.plist as a job
+    assert (seen["mode"], seen["label"]) == (0o600, LABEL)
+    assert [item.name for item in path.parent.iterdir()] == [path.name]
+
+
+def test_a_failed_bootstrap_raises_and_leaves_the_new_plist_on_disk(tmp_path):
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append(argv[1])
+        if argv[1] == "bootstrap":
+            raise subprocess.CalledProcessError(5, argv)
+
+    with pytest.raises(subprocess.CalledProcessError) as info:
+        launchd.install(["x"], tmp_path / "logs", {"LOCAL_JEV_TOKEN": "t"}, home=tmp_path, run=run)
+    path = launchd.plist_path(tmp_path)
+    assert info.value.returncode == 5
+    assert calls == ["bootout", "bootstrap"]
+    assert plistlib.loads(path.read_bytes())["EnvironmentVariables"] == {"LOCAL_JEV_TOKEN": "t"}
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_a_plist_that_cannot_be_rendered_changes_nothing(tmp_path):
+    calls = []
+    with pytest.raises(ValueError):  # a plist cannot hold a control character
+        launchd.install(
+            ["x"],
+            tmp_path / "logs",
+            {"LOCAL_JEV_TOKEN": "a\x01b"},
+            home=tmp_path,
+            run=lambda argv, **kw: calls.append(argv),
+        )
+    assert calls == []
+    assert list(tmp_path.iterdir()) == []

@@ -2,6 +2,7 @@ from pathlib import Path
 
 import pytest
 
+from local_jev import config as config_module
 from local_jev.config import LAYA_REVISION, ConfigError, Settings, load_settings
 
 
@@ -87,3 +88,35 @@ def test_invalid_values_are_rejected(tmp_path, text, message):
     config.write_text(text)
     with pytest.raises(ConfigError, match=message):
         load_settings(config, env={})
+
+
+class _Reads(dict):
+    """An environment that remembers which names were looked up."""
+
+    def __init__(self, data):
+        super().__init__(data)
+        self.names = set()
+
+    def get(self, key, default=None):
+        self.names.add(key)
+        return super().get(key, default)
+
+    def __getitem__(self, key):
+        self.names.add(key)
+        return super().__getitem__(key)
+
+
+def test_env_vars_lists_every_variable_load_settings_reads(tmp_path):
+    env = _Reads({"LOCAL_JEV_CONFIG": str(tmp_path / "missing.toml")})
+    load_settings(env=env)
+    assert set(config_module.ENV_VARS) == env.names
+    assert len(set(config_module.ENV_VARS)) == len(config_module.ENV_VARS)
+
+
+def test_path_env_vars_are_the_ones_that_hold_a_path():
+    assert set(config_module.PATH_ENV_VARS) == {
+        "LOCAL_JEV_CONFIG",
+        "LOCAL_JEV_LOG_DIR",
+        "LOCAL_JEV_RESULTS_DIR",
+    }
+    assert set(config_module.PATH_ENV_VARS) <= set(config_module.ENV_VARS)

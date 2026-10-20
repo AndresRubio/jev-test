@@ -1,10 +1,16 @@
+import functools
 import json
 import logging
+import os
+import plistlib
 import runpy
+import stat
 import subprocess
 import sys
+import threading
 from contextlib import contextmanager
 from dataclasses import replace
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -24,6 +30,12 @@ from tests.fakes import FakeEngine
 
 QUESTIONS = '{"q": {"type": "noul", "instructions": "?"}}'
 REFUND = '{"refund": {"type": "noul", "instructions": "Does the customer want money back?"}}'
+BAD_TOKEN_MESSAGE = "could not send the request: LOCAL_JEV_TOKEN is not a valid HTTP header value\n"
+
+# Taken before no_side_effects replaces them, for the few tests that use the real thing on purpose.
+REAL_REQUEST = httpx2.request
+REAL_INSTALL = launchd.install
+REAL_UNINSTALL = launchd.uninstall
 
 
 def _refuse(what):
@@ -47,6 +59,12 @@ def no_side_effects(monkeypatch, tmp_path):
     Each call below is replaced by a call to pytest.fail. A test that needs one of them replaces it
     again with monkeypatch.setattr, and the later setattr wins.
     """
+    # install-agent copies these from the environment, so a developer's own settings must not leak in.
+    others = [
+        name for name in os.environ if name.startswith("LOCAL_JEV_") and name != "LOCAL_JEV_CONFIG"
+    ]
+    for name in [*others, "HF_HOME", "HF_HUB_CACHE"]:
+        monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     monkeypatch.setenv("LOCAL_JEV_LOG_DIR", str(tmp_path / "logs"))
     monkeypatch.setenv("LOCAL_JEV_RESULTS_DIR", str(tmp_path / "results"))
@@ -54,11 +72,57 @@ def no_side_effects(monkeypatch, tmp_path):
     # cli.subprocess and launchd.subprocess are one module, so these two lines patch the same name.
     monkeypatch.setattr(cli.subprocess, "run", _refuse("subprocess.run"))
     monkeypatch.setattr(launchd.subprocess, "run", _refuse("subprocess.run"))
+    # install and uninstall bind run=subprocess.run at import, so REAL_INSTALL would still run launchctl.
+    monkeypatch.setitem(REAL_INSTALL.__kwdefaults__, "run", _refuse("launchctl"))
+    monkeypatch.setitem(REAL_UNINSTALL.__kwdefaults__, "run", _refuse("launchctl"))
     monkeypatch.setattr(cli.launchd, "install", _refuse("launchd.install"))
     monkeypatch.setattr(cli.launchd, "uninstall", _refuse("launchd.uninstall"))
     monkeypatch.setattr(cli.httpx2, "request", _refuse("an HTTP request"))
     monkeypatch.setattr(uvicorn, "run", _refuse("uvicorn.run"))
     monkeypatch.setattr(checkpoints, "snapshot_download", _refuse("a model download"))
+
+
+@pytest.fixture
+def real_http(monkeypatch):
+    """Let a test send real requests, for a loopback server it starts itself."""
+    monkeypatch.setattr(cli.httpx2, "request", REAL_REQUEST)
+
+
+@contextmanager
+def loopback_server(status=200, body=None):
+    """A small HTTP server on 127.0.0.1. Yields its port and the (request line, Authorization) pairs it saw."""
+    seen = []
+    reply = json.dumps({"ok": True} if body is None else body).encode()
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            seen.append((self.requestline, self.headers.get("Authorization")))
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(reply)))
+            self.end_headers()
+            self.wfile.write(reply)
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield server.server_address[1], seen
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def sandboxed_install(monkeypatch, tmp_path, run):
+    """Make install-agent call the real launchd.install on tmp_path/home, with `run` in place of launchctl."""
+    monkeypatch.setattr(
+        cli.launchd, "install", functools.partial(REAL_INSTALL, home=tmp_path / "home", run=run)
+    )
+    return tmp_path / "home" / "Library" / "LaunchAgents" / f"{launchd.LABEL}.plist"
 
 
 def test_version(capsys):
@@ -95,6 +159,7 @@ def test_connect_apply_runs_claude_with_the_real_token(monkeypatch):
 
     monkeypatch.setattr(cli.subprocess, "run", fake_run)
     assert cli.main(["connect", "--apply"]) == 0
+    # claude mcp add declares --header as <header...>, so the name and the URL must come before it.
     assert calls == [
         [
             "claude",
@@ -104,12 +169,21 @@ def test_connect_apply_runs_claude_with_the_real_token(monkeypatch):
             "http",
             "--scope",
             "user",
-            "--header",
-            "Authorization: Bearer s3cret",
             "local-jev",
             "http://127.0.0.1:7711/mcp",
+            "--header",
+            "Authorization: Bearer s3cret",
         ]
     ]
+
+
+def test_connect_prints_the_header_after_the_name_and_url(capsys, monkeypatch):
+    monkeypatch.setenv("LOCAL_JEV_TOKEN", "s3cret")
+    assert cli.main(["connect"]) == 0
+    assert capsys.readouterr().out == (
+        "claude mcp add --transport http --scope user local-jev http://127.0.0.1:7711/mcp "
+        '--header "Authorization: Bearer $LOCAL_JEV_TOKEN"\n'
+    )
 
 
 def test_connect_codex_snippet(capsys, monkeypatch):
@@ -374,22 +448,162 @@ def test_install_agent_shows_the_plist_before_it_asks(monkeypatch, capsys):
     assert capsys.readouterr().out == "cancelled\n"
 
 
-def test_install_agent_passes_the_config_path_and_the_log_folder(monkeypatch, tmp_path, capsys):
+def fake_agent_install(monkeypatch, tmp_path):
+    """Replace launchd.install with a recorder; return the dict of what install-agent passed to it."""
     installed = {}
 
     def fake_install(program, log_dir, env):
-        installed.update(log_dir=log_dir, env=env)
+        installed.update(program=program, log_dir=log_dir, env=env)
         return tmp_path / "agent.plist"
 
     monkeypatch.setattr(cli.launchd, "install", fake_install)
+    return installed
+
+
+def test_install_agent_passes_the_config_path_and_the_log_folder(monkeypatch, tmp_path, capsys):
+    installed = fake_agent_install(monkeypatch, tmp_path)
     assert cli.main(["install-agent", "--yes"]) == 0
-    assert installed == {
-        "log_dir": tmp_path / "logs",
-        "env": {"LOCAL_JEV_CONFIG": str(tmp_path / "none.toml")},
+    assert installed["log_dir"] == tmp_path / "logs"
+    assert installed["env"] == {
+        "LOCAL_JEV_CONFIG": str(tmp_path / "none.toml"),
+        "LOCAL_JEV_LOG_DIR": str(tmp_path / "logs"),
+        "LOCAL_JEV_RESULTS_DIR": str(tmp_path / "results"),
     }
     assert capsys.readouterr().out.endswith(
         f"installed {tmp_path / 'agent.plist'}; local-jev now starts at login (logs in {tmp_path / 'logs'})\n"
     )
+
+
+def test_install_agent_copies_every_setting_the_server_reads(monkeypatch, tmp_path, capsys):
+    # The login agent does not read the shell profile, so a setting made there would reach `status`
+    # and `connect` but not the server.
+    copied = {
+        "LOCAL_JEV_PORT": "7800",
+        "LOCAL_JEV_BACKEND": "remote",
+        "LOCAL_JEV_REMOTE_URL": "http://127.0.0.1:9",
+        "LOCAL_JEV_IDLE_UNLOAD_MINUTES": "5",
+        "LOCAL_JEV_NOUL_MODE": "ab_labels",
+        "LOCAL_JEV_LOG_INPUTS": "true",
+        "LOCAL_JEV_TOKEN": "s3cret",
+    }
+    for name, value in copied.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
+    monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path / "hf" / "hub"))
+    # Not settings the server reads, or credentials that must stay out of the plist. JEV_API_KEY is
+    # the variable the config file names as the hosted-Jev key.
+    (tmp_path / "none.toml").write_text('[remote]\napi_key_env = "JEV_API_KEY"\n')
+    monkeypatch.setenv("LOCAL_JEV_SOMETHING_ELSE", "1")
+    monkeypatch.setenv("HF_TOKEN", "hf_secret")
+    monkeypatch.setenv("JEV_API_KEY", "jev_secret")
+    installed = fake_agent_install(monkeypatch, tmp_path)
+    assert cli.main(["install-agent", "--yes"]) == 0
+    assert installed["env"] == {
+        **copied,
+        "LOCAL_JEV_CONFIG": str(tmp_path / "none.toml"),
+        "LOCAL_JEV_LOG_DIR": str(tmp_path / "logs"),
+        "LOCAL_JEV_RESULTS_DIR": str(tmp_path / "results"),
+        "HF_HOME": str(tmp_path / "hf"),
+        "HF_HUB_CACHE": str(tmp_path / "hf" / "hub"),
+    }
+    out = capsys.readouterr().out
+    shown = plistlib.loads(
+        out[out.index("<?xml") : out.index("</plist>") + len("</plist>")].encode()
+    )
+    assert shown["EnvironmentVariables"] == {**installed["env"], "LOCAL_JEV_TOKEN": "***"}
+    for secret in ("s3cret", "hf_secret", "jev_secret"):
+        assert secret not in out
+
+
+def test_install_agent_makes_the_copied_paths_absolute(monkeypatch, tmp_path, capsys):
+    # The agent starts in /, so a relative path would point somewhere else than it does here.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("LOCAL_JEV_CONFIG", "conf/local.toml")
+    monkeypatch.setenv("LOCAL_JEV_LOG_DIR", "logs")
+    monkeypatch.setenv("LOCAL_JEV_RESULTS_DIR", "~/results")
+    monkeypatch.setenv("HF_HOME", "hf/../models")
+    # huggingface_hub expands $VAR in its two cache variables, and the agent has no shell to do it.
+    monkeypatch.setenv("HF_HUB_CACHE", "$HOME/hub")
+    installed = fake_agent_install(monkeypatch, tmp_path)
+    assert cli.main(["install-agent", "--yes"]) == 0
+    assert installed["env"] == {
+        "LOCAL_JEV_CONFIG": str(tmp_path / "conf" / "local.toml"),
+        "LOCAL_JEV_LOG_DIR": str(tmp_path / "logs"),
+        "LOCAL_JEV_RESULTS_DIR": str(tmp_path / "home" / "results"),
+        "HF_HOME": str(tmp_path / "models"),
+        "HF_HUB_CACHE": str(tmp_path / "home" / "hub"),
+    }
+    assert installed["log_dir"] == tmp_path / "logs"
+    assert capsys.readouterr().out.endswith(f"(logs in {tmp_path / 'logs'})\n")
+
+
+def test_install_agent_does_not_copy_a_setting_that_is_empty(monkeypatch, tmp_path):
+    monkeypatch.setenv("LOCAL_JEV_NOUL_MODE", "")  # config reads an empty value as not set
+    monkeypatch.setenv("HF_HOME", "")
+    installed = fake_agent_install(monkeypatch, tmp_path)
+    assert cli.main(["install-agent", "--yes"]) == 0
+    assert "LOCAL_JEV_NOUL_MODE" not in installed["env"]
+    assert "HF_HOME" not in installed["env"]
+
+
+def test_install_agent_writes_the_real_token_to_a_private_plist_and_shows_it_masked(
+    monkeypatch, tmp_path, capsys
+):
+    monkeypatch.setenv("LOCAL_JEV_TOKEN", "s3cret")
+    monkeypatch.setenv("LOCAL_JEV_PORT", "7800")
+    launchctl = []
+    plist = sandboxed_install(monkeypatch, tmp_path, lambda argv, **kw: launchctl.append(argv))
+    assert cli.main(["install-agent", "--yes"]) == 0
+    written = plistlib.loads(plist.read_bytes())["EnvironmentVariables"]
+    assert (written["LOCAL_JEV_TOKEN"], written["LOCAL_JEV_PORT"]) == ("s3cret", "7800")
+    assert stat.S_IMODE(plist.stat().st_mode) == 0o600
+    assert [argv[1] for argv in launchctl] == ["bootout", "bootstrap"]
+    out = capsys.readouterr().out
+    assert "s3cret" not in out
+    assert out.endswith(
+        f"installed {plist}; local-jev now starts at login (logs in {tmp_path / 'logs'})\n"
+    )
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can write into a read-only folder")
+def test_install_agent_that_cannot_write_the_plist_says_so_and_stops_nothing(
+    monkeypatch, tmp_path, capsys
+):
+    launchctl = []
+    plist = sandboxed_install(monkeypatch, tmp_path, lambda argv, **kw: launchctl.append(argv))
+    plist.parent.mkdir(parents=True)
+    plist.parent.chmod(0o500)
+    try:
+        assert cli.main(["install-agent", "--yes"]) == 1
+    finally:
+        plist.parent.chmod(0o700)
+    captured = capsys.readouterr()
+    assert captured.err.startswith("could not install the login agent: ")
+    assert "Permission denied" in captured.err
+    assert captured.err.endswith("the agent that is running now, if any, was left alone\n")
+    assert "installed" not in captured.out
+    assert launchctl == []
+
+
+def test_install_agent_whose_launchctl_fails_says_what_it_left_behind(
+    monkeypatch, tmp_path, capsys
+):
+    def run(argv, **kwargs):
+        if argv[1] == "bootstrap":
+            raise subprocess.CalledProcessError(5, argv)
+
+    plist = sandboxed_install(monkeypatch, tmp_path, run)
+    assert cli.main(["install-agent", "--yes"]) == 1
+    captured = capsys.readouterr()
+    assert plist.is_file()
+    assert captured.err == (
+        "launchctl could not load the login agent (exit status 5).\n"
+        f"The plist is written at {plist}, so the agent will load at your next login."
+        " An agent that was running before has been stopped.\n"
+        f"To load it now: launchctl bootstrap gui/$UID {plist}\n"
+        "To remove it: local-jev uninstall-agent\n"
+    )
+    assert "installed" not in captured.out
 
 
 @pytest.mark.parametrize(
@@ -697,7 +911,48 @@ def test_request_returns_the_status_and_the_decoded_body(monkeypatch):
         "json": {"a": 1},
         "headers": {"X": "y"},
         "timeout": 3,
+        "trust_env": False,
     }
+
+
+def test_loopback_requests_never_go_through_a_proxy(monkeypatch, real_http):
+    # With HTTP_PROXY honoured, the bearer token and the request body would be handed to the proxy.
+    with (
+        loopback_server() as (port, target),
+        loopback_server(502, {"error": "a proxy"}) as (proxy_port, proxy),
+    ):
+        for name in ("HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"):
+            monkeypatch.setenv(name, f"http://127.0.0.1:{proxy_port}")
+        monkeypatch.setenv("LOCAL_JEV_PORT", str(port))
+        monkeypatch.setenv("LOCAL_JEV_TOKEN", "probe-token-1")
+        assert cli.main(["status"]) == 0
+    assert proxy == []
+    assert target == [("GET /v1/status HTTP/1.1", "Bearer probe-token-1")]
+
+
+@pytest.mark.parametrize(
+    "token",
+    ["probe-token-2 ", "probe\ntoken-4", "probe\rtoken-5"],
+    ids=["trailing-space", "newline", "carriage-return"],
+)
+def test_a_token_that_is_not_a_header_value_is_never_printed(monkeypatch, capsys, real_http, token):
+    # httpx2 refuses the header with a message that repeats the whole value, token included.
+    with loopback_server() as (port, seen):
+        monkeypatch.setenv("LOCAL_JEV_PORT", str(port))
+        monkeypatch.setenv("LOCAL_JEV_TOKEN", token)
+        assert cli.main(["status"]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == BAD_TOKEN_MESSAGE
+    assert seen == []
+
+
+def test_a_token_that_is_not_ascii_is_never_printed_or_sent(monkeypatch, capsys, real_http):
+    # httpx2 cannot encode it as a header, and its error names the character it failed on.
+    monkeypatch.setenv("LOCAL_JEV_TOKEN", "probe-tökén-6")
+    assert cli.main(["status"]) == 1
+    captured = capsys.readouterr()
+    assert (captured.out, captured.err) == ("", BAD_TOKEN_MESSAGE)
 
 
 def test_request_wraps_a_reply_that_is_not_json(monkeypatch):

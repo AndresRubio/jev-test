@@ -13,6 +13,8 @@ from typing import Any
 DEFAULT_CONFIG_PATH = Path("~/.config/local-jev/config.toml")
 LAYA_REVISION = "c5d78730f3493e4fe16d61507ef4b78eef7318cf"
 CHECKPOINT_NAMES = ("english", "multilingual", "typed-decisions")
+CONFIG_ENV = "LOCAL_JEV_CONFIG"
+REMOTE_URL_ENV = "LOCAL_JEV_REMOTE_URL"
 
 
 class ConfigError(ValueError):
@@ -96,13 +98,16 @@ _ENV: dict[str, tuple[str, Any]] = {
     "LOCAL_JEV_LOG_DIR": ("log_dir", Path),
     "LOCAL_JEV_RESULTS_DIR": ("results_dir", Path),
 }
+# Every environment variable load_settings reads, and the ones among them that hold a path.
+ENV_VARS = (CONFIG_ENV, *_ENV, REMOTE_URL_ENV)
+PATH_ENV_VARS = (CONFIG_ENV, *(var for var, (_, kind) in _ENV.items() if kind is Path))
 
 
 def load_settings(path: Path | None = None, env: Mapping[str, str] | None = None) -> Settings:
     """Defaults, overlaid by the TOML file when it exists, overlaid by LOCAL_JEV_* variables."""
     env = os.environ if env is None else env
     if path is None:
-        path = Path(env.get("LOCAL_JEV_CONFIG") or DEFAULT_CONFIG_PATH)
+        path = Path(env.get(CONFIG_ENV) or DEFAULT_CONFIG_PATH)
     path = path.expanduser()
     data: dict[str, Any] = {}
     if path.exists():
@@ -142,10 +147,8 @@ def _apply_env(settings: Settings, env: Mapping[str, str]) -> Settings:
         name: _coerce(kind, env[var], var) for var, (name, kind) in _ENV.items() if env.get(var)
     }
     settings = replace(settings, **changes)
-    if env.get("LOCAL_JEV_REMOTE_URL"):
-        settings = replace(
-            settings, remote=replace(settings.remote, url=env["LOCAL_JEV_REMOTE_URL"])
-        )
+    if env.get(REMOTE_URL_ENV):
+        settings = replace(settings, remote=replace(settings.remote, url=env[REMOTE_URL_ENV]))
     return settings
 
 
