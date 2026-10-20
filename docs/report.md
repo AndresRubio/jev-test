@@ -71,28 +71,32 @@ The README's "What to expect" section has the details.
 ## Shortcuts and open risks
 
 - The plan had no type-checking step, and none was added during the build.
-- `test_an_upgrade_question_goes_to_sales` (`tests/integration/test_laya_real.py:98`) records the upgrade miss as an expected failure. Its marker has no `raises=AssertionError`, so an unrelated exception would also count as the expected failure. `test_rest_and_mcp_with_the_real_model` sends the same message through the server and only checks that the answer is one of the three labels.
+- `test_an_upgrade_question_goes_to_sales` (`tests/integration/test_laya_real.py:98`) records the upgrade miss as an expected failure. `test_rest_and_mcp_with_the_real_model` sends the same message through the server and only checks that the answer is one of the three labels.
 - The session that ran the acceptance check also wrote the 200 support messages and their expected departments, so the 150 of 200 figure is self-graded. The server for that check ran with `HF_HUB_OFFLINE=1`, which a user would not normally set.
 - During the build, the agents that did the work reported the test counts and measurements, and review agents checked them. The coordinating session ran the unit and integration suites itself before the merge, and the unit suite again on `main`. It ran neither after merging GitHub's initial `LICENSE` commit.
 - `_guarded` in `src/local_jev/api_rest.py` catches every unexpected exception, logs it and returns a 500 with a generic `internal_error` body, so a REST client never sees the cause.
 - About 118 minor review findings were deferred during the build. Their list was in a working file that was deleted after the merge. The decisions made during the build are still recorded in the spec's amendments table (section 15) and in the plan's "Recorded deviations".
 - Commits written by Sonnet and Haiku agents carry a `Co-Authored-By: Claude Opus 5.5` line, because the project's commit rule asks for that line on every commit.
 
+## Fixed after the build
+
+On 2026-10-21 the findings that the final review had parked were fixed, each with a test where the fix changes what the code does. All 630 unit tests pass, and the integration tests still give 8 passes and the one expected failure.
+
+- `serve` starts when its stderr is closed. Python sets `sys.stderr` to None in that case, and the terminal check called `isatty()` on it.
+- An inline MCP item whose id holds NaN or an infinity anywhere, such as `[NaN]`, goes by its number, so the results file stays valid JSON.
+- A `~name` path for a user the Mac does not have gives a config error that names the setting. That holds in the config file, in the `LOCAL_JEV_*` paths and in `LOCAL_JEV_CONFIG`.
+- Each warning from a tournament round goes to the question its group was cut from, worked out from the group's position. Two large choices with the same instructions no longer get each other's warnings.
+- The components table in section 5 of the spec gives the right dependencies for `security.py` and `remote.py`, and names `httpx2` for `remote.py` and `cli.py`.
+- A comment in `cli._call` says why it keeps two token checks that `main()` never reaches.
+- `repr(app.user_middleware)` shows `'***'` where the token was.
+- The upgrade test's expected-failure marker has `raises=AssertionError`.
+- The `decide_batch` description takes its time limit, and the number of long items to split at, from `batch.timeout_seconds`.
+- An https backend on this Mac is checked against `SSL_CERT_FILE` and `SSL_CERT_DIR` again, and proxies stay off for it. Its test builds a certificate with `cryptography`, which is now a declared development dependency.
+
 ## Next steps
 
-1. Put local-jev into daily use and test the login agent. The server is not running now, and `local-jev install-agent` has never run on this Mac. Test a fresh install and a reinstall, and check whether macOS privacy protection stops the agent from reading `~/Desktop`, `~/Documents` and `~/Downloads`. This repository is under `~/Desktop`, and the editable install runs the code from it.
+1. Put local-jev into daily use and test the login agent. `local-jev install-agent` has never run on this Mac, so the server only runs when someone starts it. Test a fresh install and a reinstall, and check whether macOS privacy protection stops the agent from reading `~/Desktop`, `~/Documents` and `~/Downloads`. This repository is under `~/Desktop`, and the editable install runs the code from it.
 2. Have `install-agent` generate a bearer token by default. The server and the CLI would read it from a file only the owner can read (mode 0600) whenever `LOCAL_JEV_TOKEN` is unset. Section 9 of the spec, on security and privacy, calls the token optional and would need to change.
 3. Add continuous integration and type checking. A GitHub Actions job on an Apple Silicon macOS runner can run ruff and the unit tests. Then add pyright or mypy and replace `Any` where the types are known.
-4. Fix the findings that the final review parked, and the smaller deferred ones that are still known:
-   - `src/local_jev/cli.py:371` calls `sys.stderr.isatty()`, which fails when `serve` starts with stderr closed.
-   - An inline MCP item whose id holds a nested NaN or infinity, such as `[NaN]`, still writes invalid JSON to the results file (`src/local_jev/batch.py:262`).
-   - A `~name` path for an unknown user stops every command with a traceback (`src/local_jev/config.py:202` and `:206`).
-   - Warnings from tournament rounds can go to the wrong question when two choice questions with more than 20 options share their instructions. Mapping the groups by position fixes it, and the docstring at `src/local_jev/engines/laya_mlx.py:252` should say how the mapping works.
-   - The components table in section 5 of the spec lists `config` as a dependency of `security.py` and leaves `security` out of the `remote.py` row.
-   - The bad-token check in `cli._call` can no longer be reached from `main()`. It needs a comment saying why it stays, or it can go.
-   - `repr(app.user_middleware)` shows the token (`src/local_jev/app.py:78`). Nothing logs it today.
-   - The upgrade test's expected-failure marker needs `raises=AssertionError`.
-   - The `decide_batch` tool description has 300 seconds written into its text (`src/local_jev/api_mcp.py:56`), so it becomes wrong if `batch.timeout_seconds` changes.
-   - With proxies off for a loopback remote backend, httpx2 also stops reading `SSL_CERT_FILE` and `SSL_CERT_DIR`, so a loopback https backend that relies on them fails its certificate check. Document it or pass the certificate settings explicitly.
-5. Grow the evaluation. The `ab_labels` default rests on 24 against 22 right answers out of 30. More items on pricing, catch-all options and negations, plus real examples from daily use, would show whether that margin holds. The spec lists decision heads trained on the owner's own labelled examples as future work, and they are the likely fix for these weak spots.
-6. Watch for upstream changes: a laya-mlx or checkpoint release that changes how the English temperature for 11 or more options is handled, a fix for the Codex bug where `bearer_token_env_var` is not read even when the shell sets it (openai/codex#41378), and Cursor support for newer MCP protocol versions.
+4. Grow the evaluation. The `ab_labels` default rests on 24 against 22 right answers out of 30. More items on pricing, catch-all options and negations, plus real examples from daily use, would show whether that margin holds. The spec lists decision heads trained on the owner's own labelled examples as future work, and they are the likely fix for these weak spots.
+5. Watch for upstream changes: a laya-mlx or checkpoint release that changes how the English temperature for 11 or more options is handled, a fix for the Codex bug where `bearer_token_env_var` is not read even when the shell sets it (openai/codex#41378), and Cursor support for newer MCP protocol versions.
