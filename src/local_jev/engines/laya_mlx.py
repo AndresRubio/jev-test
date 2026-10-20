@@ -14,6 +14,7 @@ from local_jev.errors import ModelUnavailable
 from local_jev.schema import MODEL_HINT as UNKNOWN_MODEL_HINT
 
 SHORTLIST_K = 20
+LOAD_HINT = f"{checkpoints.PULL_HINT}, or check that laya-mlx is 0.4.0"
 
 
 def _laya() -> Any:
@@ -168,12 +169,29 @@ class LayaMLXEngine:
     def _predict(
         self, router: Any, state: Any, questions: dict[str, dict[str, Any]], name: str
     ) -> dict[str, Any]:
+        agent = self._load(router, name)
         if any(
             q["type"] == "choice" and len(q["criteria"]) > SHORTLIST_K for q in questions.values()
         ):
-            embed = self._embed_factory(router.load(name))
+            embed = self._embed_factory(agent)
             return self._shortlist(router, state, questions, embed, k=SHORTLIST_K, model=name)
         return router.predict(state, questions, model=name)
+
+    @staticmethod
+    def _load(router: Any, name: str) -> Any:
+        """Build the checkpoint's Agent before predicting, so a failure to build it is a 503.
+
+        laya-mlx raises a plain ValueError (a config it rejects) or OSError (a missing file) when
+        it cannot build an Agent. Left alone, those reach the service as a bad request and the
+        caller is told their questions are wrong. The Router keeps the Agent it built, so the
+        predict() that follows reuses it.
+        """
+        try:
+            return router.load(name)
+        except (ValueError, OSError) as exc:
+            raise ModelUnavailable(
+                f"the {name} checkpoint failed to load: {exc}", LOAD_HINT
+            ) from exc
 
     def _predict_float32(
         self, state: Any, questions: dict[str, dict[str, Any]], name: str

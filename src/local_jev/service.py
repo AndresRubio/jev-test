@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import resource
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from typing import Any, NoReturn
 
 from local_jev import __version__
@@ -35,6 +36,7 @@ from local_jev.security import FilePolicy
 
 logger = logging.getLogger(__name__)
 TOKEN_BUDGET_HINT = "shorten option descriptions or split into two questions"
+STOP_GRACE_SECONDS = 10.0  # how long stop() waits for the calls still in flight
 
 
 def translate(exc: BaseException) -> ServiceError | None:
@@ -67,6 +69,12 @@ def _raise_translated(exc: BaseException) -> NoReturn:
     raise translated from exc
 
 
+def _shutting_down() -> ServiceError:
+    return ServiceError(
+        503, "model_unavailable", "the service is shutting down", "retry in a few seconds"
+    )
+
+
 class DecisionService:
     def __init__(
         self,
@@ -89,6 +97,10 @@ class DecisionService:
         self._files = FilePolicy(settings.batch.allowed_roots, settings.batch.max_file_bytes)
         self._clock = clock
         self._janitor: asyncio.Task[None] | None = None
+        self._closing = False  # set by stop(): new calls are refused
+        self._active = 0  # decide and decide_batch calls in flight
+        self._idle = asyncio.Event()  # set while no call is in flight
+        self._idle.set()
 
     async def start(self) -> None:
         removed = cleanup_results(self.settings.results_dir)
@@ -103,17 +115,41 @@ class DecisionService:
             self.prefetch_thread.start()
 
     async def stop(self) -> None:
-        """Cancel the janitor, stop the worker and close the log.
+        """Refuse new calls, let the ones in flight finish, then stop the worker and close the log.
 
-        Call it once no request is in flight. A request still running is answered but its decision
-        is not logged, because a closed log drops records; requests still queued are cancelled.
+        A call that arrives once stop() has begun gets a 503, and a running batch stops before its
+        next group. stop() waits up to STOP_GRACE_SECONDS for the calls already in flight, so their
+        decisions are logged. If some are still running after that it goes on without them: such a
+        decision is answered when it finishes but is not logged, because a closed log drops records,
+        and jobs still queued are cancelled.
         """
-        if self._janitor is not None:
-            self._janitor.cancel()
-        self.runtime.shutdown()
-        self.log.close()
+        self._closing = True
+        try:
+            if self._janitor is not None:
+                self._janitor.cancel()
+                # wait() returns once the janitor is done, however it ended, and stays cancellable.
+                await asyncio.wait({self._janitor})
+            try:
+                await asyncio.wait_for(self._idle.wait(), STOP_GRACE_SECONDS)
+            except TimeoutError:
+                logger.warning(
+                    "stopping after %g s with calls still running: %d",
+                    STOP_GRACE_SECONDS,
+                    self._active,
+                )
+        finally:
+            self.runtime.shutdown()
+            self.log.close()
 
     async def decide(self, body: Any, *, interface: str) -> dict[str, Any]:
+        with self._in_flight():
+            return await self._decide(body, interface=interface)
+
+    async def decide_batch(self, body: Any, *, interface: str) -> dict[str, Any]:
+        with self._in_flight():
+            return await self._decide_batch(body, interface=interface)
+
+    async def _decide(self, body: Any, *, interface: str) -> dict[str, Any]:
         request = parse_decide_request(body)
         prepared = self._prepare(request.questions)
         start = self._clock()
@@ -134,7 +170,7 @@ class DecisionService:
         )
         return response
 
-    async def decide_batch(self, body: Any, *, interface: str) -> dict[str, Any]:
+    async def _decide_batch(self, body: Any, *, interface: str) -> dict[str, Any]:
         cfg = self.settings.batch
         params = parse_batch_params(body, max_items=cfg.max_items)
         path = self._files.check(params.path) if params.path is not None else None
@@ -160,6 +196,8 @@ class DecisionService:
         deadline = start + cfg.timeout_seconds
         records: list[dict[str, Any]] = []
         for offset in range(0, len(items), cfg.group_size):
+            if self._closing:
+                raise _shutting_down()
             group = items[offset : offset + cfg.group_size]
             remaining = deadline - self._clock()
             if remaining <= 0:
@@ -227,6 +265,20 @@ class DecisionService:
                 "token_required": s.token is not None,
             },
         }
+
+    @contextlib.contextmanager
+    def _in_flight(self) -> Iterator[None]:
+        """Count a decide or decide_batch call while it runs, and refuse it once stop() began."""
+        if self._closing:
+            raise _shutting_down()
+        self._active += 1
+        self._idle.clear()
+        try:
+            yield
+        finally:
+            self._active -= 1
+            if self._active == 0:
+                self._idle.set()
 
     def _deadline_error(self, done: int, total: int) -> ServiceError:
         return ServiceError(

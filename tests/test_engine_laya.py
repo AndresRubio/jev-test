@@ -11,10 +11,11 @@ NOUL = {"q": {"type": "noul", "instructions": "Does the customer ask for money b
 class FakeRouter:
     """The parts of laya_mlx.Router the engine uses."""
 
-    def __init__(self, root, dtype, fail_always=None):
+    def __init__(self, root, dtype, fail_always=None, load_error=None):
         self.root = root
         self.dtype = dtype
         self.fail_always = fail_always
+        self.load_error = load_error
         self.fail_next = None
         self.loaded: list[str] = []
         self.predictions: list[tuple] = []
@@ -33,12 +34,12 @@ class FakeRouter:
         return name
 
     def predict(self, state, questions, model=None):
+        self.load(model)  # laya-mlx's Router.predict builds the Agent first, when it is missing
         if self.fail_always is not None:
             raise self.fail_always
         if self.fail_next is not None:
             error, self.fail_next = self.fail_next, None
             raise error
-        self.loaded = [model]
         self.predictions.append((state, questions, model))
         answers = {
             qid: {"type": "noul", "noul": 0.9, "confidence": 0.9, "answer_confidence": 0.9}
@@ -52,6 +53,8 @@ class FakeRouter:
         }
 
     def load(self, name):
+        if self.load_error is not None:
+            raise self.load_error
         self.loaded = [name]
         return f"agent:{name}"
 
@@ -59,13 +62,17 @@ class FakeRouter:
         self.loaded = []
 
 
-def make_engine(monkeypatch, *, fail_dtypes=(), **kwargs):
+def make_engine(monkeypatch, *, fail_dtypes=(), load_errors=None, **kwargs):
+    """load_errors maps a dtype to the exception that router's load() raises."""
     routers: list[FakeRouter] = []
     verified: list[str] = []
 
     def router_factory(root, dtype):
         router = FakeRouter(
-            root, dtype, FloatingPointError("nan") if dtype in fail_dtypes else None
+            root,
+            dtype,
+            FloatingPointError("nan") if dtype in fail_dtypes else None,
+            (load_errors or {}).get(dtype),
         )
         routers.append(router)
         return router
@@ -179,6 +186,64 @@ def test_non_finite_outputs_are_retried_in_float32(monkeypatch):
 def test_float32_failure_is_model_unavailable(monkeypatch):
     engine, _, _ = make_engine(monkeypatch, fail_dtypes=("float16", "float32"))
     with pytest.raises(ModelUnavailable, match="non-finite"):
+        engine.decide("x", NOUL, "auto")
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ValueError("Unsupported encoder activation: 'silu'"),
+        FileNotFoundError(2, "No such file or directory", "rl_agent_config.json"),
+    ],
+    ids=["value-error", "os-error"],
+)
+def test_a_checkpoint_that_fails_to_load_is_model_unavailable(monkeypatch, error):
+    engine, routers, _ = make_engine(monkeypatch, load_errors={"float16": error})
+    with pytest.raises(ModelUnavailable) as info:
+        engine.decide("x", NOUL, "auto")
+    assert info.value.message.startswith("the english checkpoint failed to load: ")
+    assert str(error) in info.value.message
+    assert "local-jev pull" in info.value.hint
+    assert "laya-mlx is 0.4.0" in info.value.hint
+    assert info.value.__cause__ is error
+    assert routers[0].predictions == []
+    assert engine.is_loaded() is False
+
+
+def test_a_load_failure_in_the_shortlist_path_is_model_unavailable(monkeypatch):
+    engine, _, _ = make_engine(
+        monkeypatch,
+        load_errors={"float16": ValueError("bad config")},
+        shortlist_fn=lambda *a, **k: pytest.fail("must not shortlist"),
+    )
+    many = {
+        "q": {"type": "choice", "instructions": "Which?", "criteria": [f"o{i}" for i in range(25)]}
+    }
+    with pytest.raises(ModelUnavailable, match="failed to load"):
+        engine.decide("x", many, "auto")
+
+
+def test_the_float32_retry_that_fails_to_load_is_model_unavailable(monkeypatch):
+    engine, routers, _ = make_engine(monkeypatch, load_errors={"float32": ValueError("bad config")})
+    routers[0].fail_next = FloatingPointError("nan")
+    with pytest.raises(ModelUnavailable, match="failed to load"):
+        engine.decide("x", NOUL, "auto")
+    assert [router.dtype for router in routers] == ["float16", "float32"]
+    assert routers[1].loaded == []
+
+
+def test_a_failed_load_is_tried_again_on_the_next_request(monkeypatch):
+    engine, routers, _ = make_engine(monkeypatch, load_errors={"float16": ValueError("bad config")})
+    with pytest.raises(ModelUnavailable):
+        engine.decide("x", NOUL, "auto")
+    routers[0].load_error = None
+    assert engine.decide("x", NOUL, "auto").checkpoint == "english"
+
+
+def test_a_token_budget_error_from_predict_stays_a_value_error(monkeypatch):
+    engine, routers, _ = make_engine(monkeypatch)
+    routers[0].fail_next = ValueError("Question 'q' has too many options for the token budget")
+    with pytest.raises(ValueError, match="token budget"):
         engine.decide("x", NOUL, "auto")
 
 
