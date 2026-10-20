@@ -35,6 +35,11 @@ SHORT_MESSAGES = (
     "Thanks, it works great now!",
 )
 BATCH_ITEMS = [f"{SHORT_MESSAGES[i % len(SHORT_MESSAGES)]} (ticket {i})" for i in range(200)]
+TWO = {**ONE, "q2": {"type": "noul", "instructions": "Does the customer report a bug?"}}
+LONG_TEXT = (
+    "The customer wrote a long message about the invoice, the delivery and the account settings. "
+)
+LONG_ITEMS = [f"Ticket {i}. " + LONG_TEXT * 25 for i in range(200)]
 
 
 def timed(base: str, state: str, questions: dict) -> float:
@@ -47,15 +52,24 @@ def timed(base: str, state: str, questions: dict) -> float:
     return elapsed
 
 
-def batch_rate(base: str) -> float:
-    """Items per second for one POST /v1/batch of BATCH_ITEMS with one yes/no question."""
+def batch_rate(base: str, items: list[str], questions: dict) -> float:
+    """Items per second for one POST /v1/batch of `items` with `questions`."""
     start = time.perf_counter()
     response = httpx2.post(
-        f"{base}/v1/batch", json={"questions": ONE, "items": BATCH_ITEMS}, timeout=600
+        f"{base}/v1/batch", json={"questions": questions, "items": items}, timeout=600
     )
     elapsed = time.perf_counter() - start
     response.raise_for_status()
-    return len(BATCH_ITEMS) / elapsed
+    return len(items) / elapsed
+
+
+def state_tokens(base: str, state: str) -> int:
+    """The length of `state` in tokens, as the checkpoint that answers it counts them."""
+    response = httpx2.post(
+        f"{base}/v1/systemone", json={"state": state, "questions": ONE}, timeout=120
+    )
+    response.raise_for_status()
+    return response.json()["local"]["usage"]["state_tokens"]
 
 
 def footprint_mb(pid: int) -> float:
@@ -90,7 +104,11 @@ def main() -> int:
         unloaded = httpx2.get(f"{base}/v1/status", timeout=5).json()["engine"]["loaded"] == []
         idle_mb = footprint_mb(process.pid)
         reload_ms = timed(base, ENGLISH, ONE)
-        rates = [batch_rate(base) for _ in range(3)]  # last, so it cannot move the other figures
+        # The batches run last, so they cannot move the figures above.
+        short_one = [batch_rate(base, BATCH_ITEMS, ONE) for _ in range(3)]
+        short_two = [batch_rate(base, BATCH_ITEMS, TWO) for _ in range(3)]
+        long_tokens = state_tokens(base, LONG_ITEMS[0])
+        long_one = [batch_rate(base, LONG_ITEMS, ONE) for _ in range(3)]
     one_median, ten_median = statistics.median(one), statistics.median(ten)
     rows = [
         ("One short question, median", f"{one_median:.1f} ms", "≤ 100 ms", one_median <= 100),
@@ -109,7 +127,19 @@ def main() -> int:
         ("Models unloaded after idle", str(unloaded), "True", unloaded),
         (
             "Batch of 200 short items, one yes/no question, median of 3",
-            f"{statistics.median(rates):.0f} items/s",
+            f"{statistics.median(short_one):.0f} items/s",
+            "",
+            None,
+        ),
+        (
+            "Batch of 200 short items, two yes/no questions, median of 3",
+            f"{statistics.median(short_two):.0f} items/s",
+            "",
+            None,
+        ),
+        (
+            f"Batch of 200 items of about {long_tokens} tokens, one yes/no question, median of 3",
+            f"{statistics.median(long_one):.0f} items/s",
             "",
             None,
         ),

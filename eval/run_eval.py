@@ -22,7 +22,7 @@ RESULTS = Path(__file__).with_name("results.md")
 AB_LABELS = {"true": "A", "false": "B"}
 
 
-def predict(base: str, item: dict[str, Any], ab_labels: bool) -> tuple[Any, str]:
+def predict(base: str, item: dict[str, Any], ab_labels: bool) -> tuple[Any, str, dict[str, Any]]:
     question = dict(item["question"])
     if ab_labels:
         question["labels"] = AB_LABELS
@@ -40,19 +40,24 @@ def predict(base: str, item: dict[str, Any], ab_labels: bool) -> tuple[Any, str]
         guess = answer["choice"]
     else:
         guess = int(max(answer["probabilities"], key=answer["probabilities"].get))
-    return guess, body["local"]["checkpoint"]
+    return guess, body["local"]["checkpoint"], answer
 
 
-def evaluate(base: str, items: list[dict[str, Any]]) -> dict[str, dict[str, list[int]]]:
+def evaluate(
+    base: str, items: list[dict[str, Any]]
+) -> tuple[dict[str, dict[str, list[int]]], list[dict[str, Any]]]:
     table: dict[str, dict[str, list[int]]] = {}
+    misses: list[dict[str, Any]] = []
     for mode in ("native", "ab_labels"):
         stats: dict[str, list[int]] = defaultdict(lambda: [0, 0])
         for item in items:
             kind = item["question"]["type"]
             if mode == "ab_labels" and kind != "noul":
                 continue
-            guess, checkpoint = predict(base, item, ab_labels=mode == "ab_labels")
+            guess, checkpoint, answer = predict(base, item, ab_labels=mode == "ab_labels")
             correct = int(guess == item["expected"])
+            if not correct:
+                misses.append({"mode": mode, "item": item, "guess": guess, "answer": answer})
             keys = [kind, f"{kind} · {checkpoint}"] + (
                 ["noul · negations"] if item.get("negation") else []
             )
@@ -60,10 +65,32 @@ def evaluate(base: str, items: list[dict[str, Any]]) -> dict[str, dict[str, list
                 stats[key][0] += correct
                 stats[key][1] += 1
         table[mode] = dict(stats)
-    return table
+    return table, misses
 
 
-def render(table: dict[str, dict[str, list[int]]]) -> tuple[str, str]:
+def shown(item: dict[str, Any], value: Any) -> str:
+    """An expected value or an answer in words: yes or no, a label, or a level and its name."""
+    question = item["question"]
+    if question["type"] == "noul":
+        return "yes" if value else "no"
+    if question["type"] == "choice":
+        return str(value)
+    return f"{value} ({str(question['criteria'][value]).split(':')[0]})"
+
+
+def probability(miss: dict[str, Any]) -> str:
+    """P(yes) for a yes/no item, else the probability of the answer the model gave."""
+    answer = miss["answer"]
+    if miss["item"]["question"]["type"] == "noul":
+        return f"{answer['noul']:.4f}"
+    return f"{answer['probabilities'][str(miss['guess'])]:.4f}"
+
+
+def cell(value: Any) -> str:
+    return str(value).replace("|", "\\|")
+
+
+def render(table: dict[str, dict[str, list[int]]], misses: list[dict[str, Any]]) -> tuple[str, str]:
     native, ab = table["native"]["noul"], table["ab_labels"]["noul"]
     winner = "ab_labels" if ab[0] > native[0] else "native"
     lines = [
@@ -82,6 +109,29 @@ def render(table: dict[str, dict[str, list[int]]]) -> tuple[str, str]:
         f"The default `noul_mode` is `{winner}`, the mode with more correct yes/no answers: "
         f"native {native[0]}/{native[1]}, ab_labels {ab[0]}/{ab[1]}. A tie goes to `native`."
     )
+    lines += [
+        "",
+        "## Misses",
+        "",
+        "Probability is P(yes) for a yes/no item, and the probability of the given answer for a "
+        "choice or a score.",
+        "",
+        "| Mode | Item | Text | Question | Expected | Answer | Probability |",
+        "|---|---|---|---|---|---|---|",
+    ]
+    for miss in misses:
+        item = miss["item"]
+        name = item["id"] + (" (negation)" if item.get("negation") else "")
+        row = [
+            miss["mode"],
+            name,
+            item["state"],
+            item["question"]["instructions"],
+            shown(item, item["expected"]),
+            shown(item, miss["guess"]),
+            probability(miss),
+        ]
+        lines.append("| " + " | ".join(cell(value) for value in row) + " |")
     return "\n".join(lines) + "\n", winner
 
 
@@ -91,8 +141,8 @@ def main() -> int:
     ]
     with temporary_server() as (base, _process):
         wait_until_ready(base)
-        table = evaluate(base, items)
-    text, winner = render(table)
+        table, misses = evaluate(base, items)
+    text, winner = render(table, misses)
     RESULTS.write_text(text, encoding="utf-8")
     print(text)
     print(f"winner: {winner}")
