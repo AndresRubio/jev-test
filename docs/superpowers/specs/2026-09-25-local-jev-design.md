@@ -265,7 +265,7 @@ claude mcp add --transport http --scope user local-jev http://127.0.0.1:7711/mcp
    - `ab_labels` adds `"labels": {"true": "A", "false": "B"}` to every `noul` question that has no `labels` of its own. laya-mlx 0.4.0 shows these neutral labels to the model and still returns `noul` = P(true). This is Laya's documented workaround for label bias.
    - Callers may always pass their own `labels`.
    - The default is set by the evaluation in §10.3: the mode with higher accuracy on the yes/no set wins, and a tie goes to `native`.
-3. **More than 20 options** are shortlisted to the top 20 with `laya_mlx.predict_shortlist` and `embed_fn_from_agent`. The answer gains `shortlisted: {"kept": [...], "dropped": n}`, and its probabilities cover only the kept labels.
+3. **More than 20 options** are narrowed by `laya_mlx.predict_tournament` in elimination rounds. Each round cuts the options into groups of at most 20, answers every group in one shared forward pass, and sends each group's winner to the next round. One final call then answers every question, with each narrowed choice cut to its finalists. A choice with 20 or fewer options is never narrowed, even when it shares a request with a larger one. The answer gains `shortlisted: {"kept": [...], "dropped": n}`, and its probabilities cover only the finalists.
 4. **Option-budget overflow.** When laya-mlx raises "too many options for the token budget", the service returns a 422 with the hint "shorten option descriptions or split into two questions".
 5. **Truncation and collapsed options.** laya-mlx 0.4.0 reports both in `usage`:
    - `truncated_questions` and the token counts become the warning `state_truncated` on each affected answer, with the hint "use decide_batch with format=chunks, or model=multilingual".
@@ -442,3 +442,4 @@ New releases appeared between drafting and approval. The plan follows these chan
 | New modules `errors.py`, `checkpoints.py`, `service.py` | Clearer unit boundaries. REST and MCP share one service. |
 | `warnings` are strings that start with a code; `usage` holds only Jev's fields; Laya's `action` is dropped | Jev compatibility, and readable messages for agents. |
 | `httpx2` instead of `httpx` | It is already a dependency of the MCP SDK, and Starlette's test client prefers it. |
+| 2026-10-20: more than 20 options are narrowed by `laya_mlx.predict_tournament` in groups of at most 20 (was `predict_shortlist` with `embed_fn_from_agent`) | On the real weights, the embedding shortlist dropped the right label in 3 of 3 cases with 30 options, and the engine gave a wrong answer at 0.82 to 0.98 each time. The tournament picked the right label in all three (0.93 to 0.96). |
