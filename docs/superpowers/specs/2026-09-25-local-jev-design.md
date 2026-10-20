@@ -109,15 +109,15 @@ Each unit has one purpose and a narrow interface. The package is `local_jev` in 
 | `guard.py` | Changes applied before and after inference (§7). It is engine-agnostic, except for flags an engine declares. | `schema`, engine capabilities |
 | `engines/base.py` | The `Engine` protocol: `decide(state, questions, model) -> dict`, `embed(texts)`, `load()`, `unload()`, `status()`, `capabilities`. | none |
 | `engines/laya_mlx.py` | Wraps `laya_mlx.Router` (§8). Also handles truncation measurement, shortlisting, and retrying in 32-bit when outputs are not finite. | `laya-mlx` |
-| `engines/remote.py` | Forwards to a Jev-compatible URL, with an optional bearer token taken from an environment variable. | `httpx` |
+| `engines/remote.py` | Forwards to a Jev-compatible URL, with an optional bearer token taken from an environment variable. | `security`, `httpx2` |
 | `runtime.py` | The inference worker thread, a bounded queue, per-request timeouts, the idle-unload timer, and a latency histogram. | an engine |
 | `batch.py` | Item readers (inline, JSONL, CSV, lines, chunks), filtering, top-k selection, summaries, and the JSONL result writer. | `runtime`, `guard` |
-| `security.py` | Host/Origin allowlist middleware, the optional bearer token, and the file-access policy. | `config` |
+| `security.py` | Host/Origin allowlist middleware, the optional bearer token, and the file-access policy. | `errors` |
 | `api_rest.py` | `/v1/systemone`, `/v1/batch`, `/v1/status`, `/health`. | `runtime`, `batch` |
 | `api_mcp.py` | `MCPServer` with the `decide`, `decide_batch` and `status` tools, and their descriptions (§6.2). | `runtime`, `batch` |
 | `app.py` | Assembles the Starlette app: middleware, REST routes, MCP mount, and a lifespan that runs `mcp.session_manager.run()`. | all of the above |
 | `decision_log.py` | The decision log in JSONL, with size-based rotation. | `config` |
-| `cli.py` | The `local-jev` command (§6.3). | `httpx`, `app`, `launchd` |
+| `cli.py` | The `local-jev` command (§6.3). | `httpx2`, `app`, `launchd` |
 | `launchd.py` | Renders, installs and removes the login agent plist. | none |
 
 ## 6. Interfaces
