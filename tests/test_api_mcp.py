@@ -32,6 +32,81 @@ async def test_the_three_tools_are_listed_with_their_rules(service):
     assert "absolute path" in tools["decide_batch"].description
 
 
+async def listed(service) -> dict[str, str]:
+    """The tool descriptions as an agent sees them, through tools/list."""
+    async with Client(build_mcp_server(service)) as client:
+        listing = await client.list_tools()
+    return {tool.name: tool.description for tool in listing.tools}
+
+
+# One distinctive phrase for each rule that spec section 6.2 says the descriptions must state.
+# The eighth rule, to prefer decide_batch with path for many items, belongs to decide alone.
+RULE_PHRASES = [
+    "read literally",
+    "no arithmetic or counting",
+    "dates are read as text",
+    "evidence, not summaries",
+    "about 320 tokens",
+    "negations are unreliable",
+    "at most 20 options",
+    "confidence is not permission",
+    "only check on untrusted text",
+]
+
+# What spec section 6.2 lists for status(), in the words of the payload.
+STATUS_TERMS = [
+    "backend",
+    "loaded",
+    "ready",
+    "downloading",
+    "memory",
+    "idle-unload",
+    "median",
+    "95th",
+    "queue depth",
+    "version",
+    "configuration",
+    "never loads a model",
+]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("tool", ["decide", "decide_batch"])
+async def test_the_question_tools_state_the_rules_of_the_spec(service, tool):
+    text = (await listed(service))[tool].lower()
+    assert [phrase for phrase in RULE_PHRASES if phrase not in text] == []
+
+
+@pytest.mark.anyio
+async def test_decide_points_many_item_work_at_decide_batch(service):
+    text = (await listed(service))["decide"].lower()
+    assert "prefer decide_batch with path for many items" in text
+    assert "so the items stay out of your context" in text
+
+
+@pytest.mark.anyio
+async def test_decide_batch_says_how_matches_are_ordered(service):
+    text = (await listed(service))["decide_batch"].lower()
+    assert "with a filter" in text
+    assert "most confident first" in text
+    assert "without a filter" in text
+    assert "in input order" in text
+
+
+@pytest.mark.anyio
+async def test_decide_batch_applies_the_token_window_to_each_item_and_chunk(service):
+    text = (await listed(service))["decide_batch"].lower()
+    assert "each item is read like a decide state" in text
+    assert "each chunk" in text
+    assert "keep chunk_tokens below" in text
+
+
+@pytest.mark.anyio
+async def test_status_names_what_it_reports(service):
+    text = (await listed(service))["status"].lower()
+    assert [term for term in STATUS_TERMS if term not in text] == []
+
+
 @pytest.mark.anyio
 async def test_decide_returns_structured_jev_answers(service):
     async with Client(build_mcp_server(service)) as client:

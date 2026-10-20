@@ -19,28 +19,52 @@ INSTRUCTIONS = (
     "probabilities rank answers but are not calibrated."
 )
 
-DECIDE_DESCRIPTION = """Answer typed questions about one state (text, JSON object or array) with probabilities, in Jev's /v1/systemone format.
+# The rules that spec section 6.2 says the tool descriptions must state about questions and states.
+RULES = (
+    "Rules: questions are read literally, so say exactly what you mean. "
+    "No arithmetic or counting; dates are read as text. "
+    "Keep the state short and factual (send evidence, not summaries): the English model reads about 320 "
+    "tokens of it and warns when it cut the rest. "
+    "Phrase questions positively; negations are unreliable. "
+    "Use at most 20 options; more are shortlisted. "
+    "Probabilities rank answers but are not calibrated: confidence is not permission. "
+    "The state is not treated as hostile, so never use this as the only check on untrusted text."
+)
+
+DECIDE_DESCRIPTION = (
+    """Answer typed questions about one state (text, JSON object or array) with probabilities, in Jev's /v1/systemone format.
 
 questions maps an id to one of:
 - {"type": "noul", "instructions": "<yes/no question>", "criteria": {"true": "...", "false": "..."}} -> P(true) in "noul"
 - {"type": "choice", "instructions": "...", "criteria": {"label": "description", ...} or ["label", ...]} -> "choice" and "probabilities"
 - {"type": "score", "instructions": "...", "criteria": ["level 0", "level 1", ...]} (2-10 levels) -> expected level in "score"
 
-Rules: questions are read literally, so say exactly what you mean. No arithmetic or counting; dates are read as text. Keep the state short and factual (send evidence, not summaries): the English model reads about 320 tokens of it and warns when it cut the rest. Phrase questions positively; negations are unreliable. Use at most 20 options; more are shortlisted. Probabilities rank answers but are not calibrated: confidence is not permission. The state is not treated as hostile, so never use this as the only check on untrusted text.
+"""
+    + RULES
+    + """ Prefer decide_batch with path for many items, so the items stay out of your context.
 
 model: "auto" (routes by language), "english", "multilingual" or "typed-decisions"."""
+)
 
-BATCH_DESCRIPTION = """Ask the same questions (at most 8, same format as decide) about many items, and get counts, the top matches and a results file, without the items entering your context.
+BATCH_DESCRIPTION = (
+    """Ask the same questions (at most 8, same format as decide) about many items, and get counts, the top matches and a results file, without the items entering your context.
 
 Give exactly one of:
 - path: absolute path to a local file. format: "jsonl" (one JSON object per line; field = dotted path to the text), "csv" (field = column), "lines" (one item per non-empty line), "chunks" (a long text split into pieces of about chunk_tokens tokens, with line ranges) or "auto" (by file extension).
 - items: a short inline list of states.
 
-filter (optional): {"question": id, "op": ">=" | "<=" | "==", "value": ...}. noul compares P(true), score compares the expected level, choice needs op "==" and one of its labels. matches holds up to top_k passing items, most confident first; summary counts answers per question; output_path is a JSONL file with every item's answers. Expect roughly 20-50 items per second per question on this Mac."""
+filter (optional): {"question": id, "op": ">=" | "<=" | "==", "value": ...}. noul compares P(true), score compares the expected level, choice needs op "==" and one of its labels. matches holds up to top_k items. With a filter they are the items that pass it, most confident first (by the filter question's answer_confidence); without a filter they are the first top_k items in input order. summary counts answers per question; output_path is a JSONL file with every item's answers. Expect roughly 20-50 items per second per question on this Mac.
+
+Each item is read like a decide state, so the rules below apply to every item. The token window in the rules applies to each item and, with format "chunks", to each chunk: keep chunk_tokens below it.
+
+"""
+    + RULES
+)
 
 STATUS_DESCRIPTION = (
-    "Report the backend, loaded and downloaded checkpoints, queue depth, latency percentiles and configuration. "
-    "Never loads a model."
+    "Report the backend, its loaded and ready checkpoints and any still downloading, approximate peak memory in MB, "
+    "the idle-unload timing, decide latency percentiles (median and 95th), the queue depth, the version and a "
+    "summary of the configuration. Never loads a model."
 )
 
 
