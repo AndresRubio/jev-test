@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Awaitable, Callable
 from contextlib import aclosing
 from typing import Any
@@ -15,6 +16,15 @@ from local_jev.errors import ServiceError, invalid, too_large
 from local_jev.schema import finite_float, refuse_constant
 
 MAX_BODY_BYTES = 5 * 1024 * 1024
+INTERNAL_ERROR = {
+    "error": {
+        "code": "internal_error",
+        "message": "unexpected server error",
+        "hint": "see server.log",
+    }
+}
+
+logger = logging.getLogger(__name__)
 
 
 class _AsciiJSONResponse(JSONResponse):
@@ -59,6 +69,11 @@ async def _guarded(
         return _AsciiJSONResponse(await handler(body))
     except ServiceError as exc:
         return _AsciiJSONResponse(exc.to_dict(), status_code=exc.status)
+    except Exception:
+        # An OSError from write_results, an MLX error, a response that cannot be rendered or an
+        # odd answer from a remote backend: the caller still gets the JSON error body.
+        logger.exception("unexpected error on %s", request.url.path)
+        return _AsciiJSONResponse(INTERNAL_ERROR, status_code=500)
 
 
 async def _read_json(request: Request) -> Any:

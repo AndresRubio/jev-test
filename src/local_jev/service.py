@@ -299,7 +299,13 @@ class DecisionService:
         self, result: EngineResult, questions: dict[str, dict[str, Any]], latency_ms: float
     ) -> dict[str, Any]:
         try:
-            return finalize(result, questions, backend=self.engine.name, latency_ms=latency_ms)
+            return finalize(
+                result,
+                questions,
+                backend=self.engine.name,
+                latency_ms=latency_ms,
+                laya_guards=self.engine.capabilities.laya_guards,
+            )
         except ModelUnavailable as exc:
             _raise_translated(exc)
 

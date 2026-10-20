@@ -309,7 +309,9 @@ def test_a_round_that_cut_the_state_warns_on_the_narrowed_question(monkeypatch):
         "truncated": True,
         "truncated_questions": ["dept"],
     }
-    answers = finalize(result, questions, backend="laya-mlx", latency_ms=0.0)["answers"]
+    answers = finalize(result, questions, backend="laya-mlx", latency_ms=0.0, laya_guards=True)[
+        "answers"
+    ]
     assert [warning.split(":")[0] for warning in answers["dept"]["warnings"]] == [
         "state_truncated",
         "shortlisted",

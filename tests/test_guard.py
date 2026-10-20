@@ -28,10 +28,14 @@ QUESTIONS = {
 }
 
 
-def run(engine=None, questions=QUESTIONS, state="yes, billing please"):
+def run(engine=None, questions=QUESTIONS, state="yes, billing please", laya_guards=True):
     engine = engine or FakeEngine()
     return finalize(
-        engine.decide(state, questions, "auto"), questions, backend="fake", latency_ms=12.34
+        engine.decide(state, questions, "auto"),
+        questions,
+        backend="fake",
+        latency_ms=12.34,
+        laya_guards=laya_guards,
     )
 
 
@@ -100,16 +104,17 @@ def test_finalize_keeps_jev_fields_and_adds_the_local_block():
     }
 
 
+LAYA_USAGE = {
+    "state_tokens": 900,
+    "state_tokens_dropped": 412,
+    "truncated": True,
+    "truncated_questions": ["refund"],
+    "options": {"dept": {"total": 2, "distinct": 1, "tokens_per_option": 1}},
+}
+
+
 def test_truncation_and_collapsed_options_become_warnings():
-    engine = FakeEngine(
-        usage_extra={
-            "state_tokens": 900,
-            "state_tokens_dropped": 412,
-            "truncated": True,
-            "truncated_questions": ["refund"],
-            "options": {"dept": {"total": 2, "distinct": 1, "tokens_per_option": 1}},
-        }
-    )
+    engine = FakeEngine(usage_extra=LAYA_USAGE)
     response = run(engine)
     assert response["answers"]["refund"]["warnings"] == [
         "state_truncated: 412 of 900 input tokens did not fit and were ignored; "
@@ -120,6 +125,13 @@ def test_truncation_and_collapsed_options_become_warnings():
     assert response["local"]["warnings"][0].startswith("refund: state_truncated:")
     assert response["local"]["usage"]["state_tokens_dropped"] == 412
     assert response["usage"] == {"input_tokens": 30, "output_tokens": 0}
+
+
+def test_an_engine_without_laya_guards_gets_no_truncation_or_collapse_warnings():
+    # Spec section 7 rule 8: a remote backend gets rules 1 and 6 only, so rule 5 is skipped.
+    response = run(FakeEngine(usage_extra=LAYA_USAGE), laya_guards=False)
+    assert [answer["warnings"] for answer in response["answers"].values()] == [[], [], []]
+    assert response["local"]["warnings"] == []
 
 
 def test_shortlist_metadata_is_reported():
@@ -150,6 +162,7 @@ def test_a_passthrough_shortlist_is_silent():
     [
         ({"type": "noul", "noul": 0.3}, 0.7),
         ({"type": "choice", "choice": "a", "probabilities": {"a": 0.6, "b": 0.4}}, 0.6),
+        ({"type": "choice", "choice": "b", "probabilities": {"a": 0.6, "b": 0.4}}, 0.4),
         ({"type": "score", "score": 1.2, "probabilities": {"0": 0.1, "1": 0.6, "2": 0.3}}, 0.6),
         ({"type": "noul", "noul": 0.3, "answer_confidence": 0.91}, 0.91),
     ],
@@ -161,7 +174,13 @@ def test_answer_confidence(answer, expected):
 def test_a_missing_answer_is_model_unavailable():
     result = EngineResult(answers={}, usage={}, model="remote")
     with pytest.raises(ModelUnavailable, match="no answer for question 'refund'"):
-        finalize(result, {"refund": QUESTIONS["refund"]}, backend="remote", latency_ms=1.0)
+        finalize(
+            result,
+            {"refund": QUESTIONS["refund"]},
+            backend="remote",
+            latency_ms=1.0,
+            laya_guards=False,
+        )
 
 
 def test_compact_answers():
@@ -179,7 +198,16 @@ SCORE_PROBABILITIES = {"0": 0.15, "1": 0.15, "2": 0.7}
 
 def from_backend(answers, questions, usage=None):
     result = EngineResult(answers=answers, usage=usage or {}, model="remote")
-    return finalize(result, questions, backend="remote", latency_ms=1.0)
+    return finalize(result, questions, backend="remote", latency_ms=1.0, laya_guards=False)
+
+
+def test_a_remote_choice_that_is_not_the_most_likely_label_gets_its_own_probability():
+    # Spec section 7 rule 6: for a choice, answer_confidence is the probability of the chosen label.
+    answers = {
+        "dept": {"type": "choice", "choice": "tech", "probabilities": {"billing": 0.7, "tech": 0.3}}
+    }
+    response = from_backend(answers, {"dept": QUESTIONS["dept"]})
+    assert response["answers"]["dept"]["answer_confidence"] == 0.3
 
 
 def test_an_answer_without_a_type_takes_the_questions_type_and_a_computed_confidence():
@@ -298,6 +326,18 @@ MALFORMED_ANSWERS = [
         {"type": "choice", "choice": "billing", "probabilities": {}, "answer_confidence": 0.9},
         "'dept' is missing 'probabilities'",
         id="empty probabilities with an answer_confidence",
+    ),
+    pytest.param(
+        "dept",
+        {"type": "choice", "choice": "sales", "probabilities": CHOICE_PROBABILITIES},
+        "the chosen label has no probability",
+        id="a choice outside its probabilities",
+    ),
+    pytest.param(
+        "dept",
+        {"type": "choice", "choice": ["billing"], "probabilities": CHOICE_PROBABILITIES},
+        "the chosen label has no probability",
+        id="a choice that is not a label",
     ),
     # a number that is missing, not a number, or not finite
     pytest.param("refund", {"type": "noul", "noul": None}, "not finite numbers", id="noul null"),

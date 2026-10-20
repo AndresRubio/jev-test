@@ -107,7 +107,7 @@ def test_an_upgrade_question_goes_to_sales(engine):
 def test_a_long_state_reports_truncation(engine):
     questions = {"q": {"type": "noul", "instructions": "Does the text mention a refund?"}}
     result = engine.decide("filler words " * 600 + "please refund me", questions, "english")
-    response = finalize(result, questions, backend="laya-mlx", latency_ms=0.0)
+    response = finalize(result, questions, backend="laya-mlx", latency_ms=0.0, laya_guards=True)
     assert response["answers"]["q"]["warnings"][0].startswith("state_truncated:")
 
 
@@ -126,7 +126,9 @@ def test_more_than_20_options_are_shortlisted(engine, instructions, criteria):
     meta = result.shortlist["q"]
     assert meta["passthrough"] is False
     assert meta["n"] == 30
-    answer = finalize(result, questions, backend="laya-mlx", latency_ms=0.0)["answers"]["q"]
+    answer = finalize(result, questions, backend="laya-mlx", latency_ms=0.0, laya_guards=True)[
+        "answers"
+    ]["q"]
     kept = answer["shortlisted"]["kept"]
     assert answer["choice"] == "billing"
     assert "billing" in kept

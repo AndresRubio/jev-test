@@ -438,6 +438,29 @@ async def test_a_remote_engine_gets_no_label_tweak_and_is_tagged_in_the_log(sett
 
 
 @pytest.mark.anyio
+async def test_a_remote_engine_gets_no_truncation_or_collapse_warnings(settings):
+    # Spec section 7 rule 8: a backend without laya_guards gets rules 1 and 6 only.
+    engine = RemoteLike(
+        usage_extra={
+            "truncated": True,
+            "truncated_questions": ["refund"],
+            "state_tokens": 900,
+            "state_tokens_dropped": 412,
+            "options": {"dept": {"total": 2, "distinct": 1}},
+        }
+    )
+    service = make(settings, engine)
+    try:
+        response = await service.decide({"state": "x", "questions": Q}, interface="test")
+        batch = await service.decide_batch({"questions": Q, "items": ["x"]}, interface="test")
+    finally:
+        await service.stop()
+    assert response["local"]["warnings"] == []
+    assert [answer["warnings"] for answer in response["answers"].values()] == [[], []]
+    assert batch["warnings"] == []
+
+
+@pytest.mark.anyio
 async def test_idle_unload_minutes_reach_the_runtime_as_seconds(settings):
     service = make(settings, idle_unload_minutes=2)
     try:

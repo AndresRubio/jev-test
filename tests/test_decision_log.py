@@ -10,7 +10,11 @@ QUESTIONS = {"refund": {"type": "noul", "instructions": "Money back?"}}
 
 def response():
     return finalize(
-        FakeEngine().decide("yes", QUESTIONS, "auto"), QUESTIONS, backend="fake", latency_ms=5.0
+        FakeEngine().decide("yes", QUESTIONS, "auto"),
+        QUESTIONS,
+        backend="fake",
+        latency_ms=5.0,
+        laya_guards=True,
     )
 
 
@@ -107,7 +111,11 @@ def test_no_state_or_question_text_reaches_the_file_by_default(tmp_path):
     }
     state = "SECRET state: my tech problem"
     result = finalize(
-        FakeEngine().decide(state, questions, "auto"), questions, backend="fake", latency_ms=1.0
+        FakeEngine().decide(state, questions, "auto"),
+        questions,
+        backend="fake",
+        latency_ms=1.0,
+        laya_guards=True,
     )
     log = DecisionLog(tmp_path, log_inputs=False)
     log.record(

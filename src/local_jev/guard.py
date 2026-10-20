@@ -37,10 +37,12 @@ def prepare_questions(
 
 
 def answer_confidence(answer: dict[str, Any]) -> float:
-    """Probability of the reported answer: max(p) for choice/score, max(p, 1 - p) for noul.
+    """Probability of the reported answer (spec section 7 rule 6).
 
-    The entropy-based `confidence` is a different quantity, so it is never used in its place.
-    Raises ModelUnavailable when the answer has no probabilities to compute the value from.
+    That is p(chosen label) for choice, max(p) for score and max(p, 1 - p) for noul. A remote
+    backend's choice need not be its most likely label. The entropy-based `confidence` is a
+    different quantity, so it is never used in its place. Raises ModelUnavailable when the answer
+    has no probability to take the value from.
     """
     if "answer_confidence" in answer:
         return round(float(answer["answer_confidence"]), 4)
@@ -48,21 +50,36 @@ def answer_confidence(answer: dict[str, Any]) -> float:
         p = float(answer["noul"])
         return round(max(p, 1.0 - p), 4)
     probabilities = answer.get("probabilities") or {}
-    if probabilities:
-        return round(max(float(value) for value in probabilities.values()), 4)
-    raise ModelUnavailable(
-        "the answer has no probabilities to take an answer_confidence from", BACKEND_HINT
-    )
+    if not probabilities:
+        raise ModelUnavailable(
+            "the answer has no probabilities to take an answer_confidence from", BACKEND_HINT
+        )
+    if answer.get("type") == "choice":
+        choice = answer.get("choice")
+        if not isinstance(choice, str) or choice not in probabilities:
+            raise ModelUnavailable(
+                "the chosen label has no probability to take an answer_confidence from",
+                BACKEND_HINT,
+            )
+        return round(float(probabilities[choice]), 4)
+    return round(max(float(value) for value in probabilities.values()), 4)
 
 
 def finalize(
-    result: EngineResult, questions: dict[str, dict[str, Any]], *, backend: str, latency_ms: float
+    result: EngineResult,
+    questions: dict[str, dict[str, Any]],
+    *,
+    backend: str,
+    latency_ms: float,
+    laya_guards: bool,
 ) -> dict[str, Any]:
     """Turn an engine result into the public, Jev-compatible response.
 
+    The truncation and collapsed-option warnings (spec section 7 rule 5) read Laya's own usage
+    fields, so an engine without laya_guards does not get them.
     Raises ModelUnavailable if the backend's answers or token counts are missing or malformed.
     """
-    per_question = _usage_warnings(result.usage)
+    per_question = _usage_warnings(result.usage) if laya_guards else {}
     answers: dict[str, dict[str, Any]] = {}
     local_warnings: list[str] = []
     for qid, question in questions.items():

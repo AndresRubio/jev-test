@@ -1,5 +1,6 @@
 import dataclasses
 import json
+import logging
 import socket
 import threading
 import time
@@ -265,6 +266,40 @@ def test_an_inline_item_id_that_mcp_reads_as_a_non_finite_number_becomes_its_num
     assert [match["id"] for match in result["structuredContent"]["matches"]] == [1, 2]
     lines = Path(shown["output_path"]).read_text().splitlines()
     assert [strict_json(line)["id"] for line in lines] == [1, 2]
+
+
+INTERNAL_ERROR = {
+    "error": {
+        "code": "internal_error",
+        "message": "unexpected server error",
+        "hint": "see server.log",
+    }
+}
+
+
+@pytest.mark.parametrize("route", ["/v1/systemone", "/v1/batch"])
+def test_an_unexpected_error_is_a_json_500_and_its_traceback_is_logged(
+    settings, tmp_path, caplog, route
+):
+    if route == "/v1/systemone":
+        engine = FakeEngine(fail_with=RuntimeError("probe failure 7"))
+        body = {"state": "x", "questions": DEPT}
+    else:
+        # write_results cannot make its folder where a file is: an OSError after the model calls.
+        blocker = tmp_path / "blocker"
+        blocker.write_text("")
+        settings = dataclasses.replace(settings, results_dir=blocker)
+        engine = FakeEngine()
+        body = {"questions": DEPT, "items": ["tech"]}
+    with caplog.at_level(logging.ERROR, logger="local_jev.api_rest"):
+        with client_for(settings, engine=engine, raise_server_exceptions=False) as client:
+            response = client.post(route, json=body)
+    assert response.status_code == 500
+    assert response.headers["content-type"] == "application/json"
+    assert response.json() == INTERNAL_ERROR
+    [record] = [record for record in caplog.records if record.name == "local_jev.api_rest"]
+    assert record.levelno == logging.ERROR
+    assert record.exc_info is not None
 
 
 def test_a_long_out_of_range_number_is_not_echoed_in_full(settings):
