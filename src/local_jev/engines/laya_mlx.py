@@ -180,7 +180,7 @@ class LayaMLXEngine:
             # request reaches the final call whole.
             recorder = _RoundRecorder(router, questions)
             raw = self._tournament(recorder, state, questions, group_size=SHORTLIST_K, model=name)
-            usage = _with_round_warnings(raw.get("usage", {}), recorder.calls[:-1], questions)
+            usage = _with_round_warnings(raw.get("usage", {}), recorder.rounds, questions)
             return {**raw, "usage": usage}
         return router.predict(state, questions, model=name)
 
@@ -216,89 +216,97 @@ class LayaMLXEngine:
 
 
 class _RoundRecorder:
-    """The Router as predict_tournament sees it: every call is forwarded and kept.
+    """The Router as predict_tournament sees it: every call is forwarded, and the rounds are kept.
 
-    Every call but the last is an elimination round, whose questions carry the tournament's own
-    ids ("0", "1", ...). A ValueError that names one of them is raised again naming the caller's
-    question.
+    The next elimination round is a call whose questions are exactly that round's groups, "0",
+    "1", ... in order. Any other call is the final one, which uses the caller's ids. Each round is
+    kept with its usage and the caller's question that owns each group. A ValueError from a round
+    that names a group is raised again naming the caller's question.
     """
 
     def __init__(self, router: Any, questions: Questions) -> None:
         self._router = router
-        self._questions = questions
-        self.calls: list[tuple[Questions, dict[str, Any]]] = []
+        self._owners = _round_owners(questions)
+        self.rounds: list[tuple[Questions, dict[str, Any], list[str]]] = []
 
     def predict(self, state: Any, questions: Questions, **kwargs: Any) -> dict[str, Any]:
+        owners = self._next_round(questions)
         try:
             result = self._router.predict(state, questions, **kwargs)
         except ValueError as exc:
-            renamed = _renamed(exc, questions, self._questions)
+            renamed = None if owners is None else _renamed(exc, owners)
             if renamed is None:
                 raise
             raise renamed from exc
-        self.calls.append((questions, result.get("usage") or {}))
+        if owners is not None:
+            self.rounds.append((questions, result.get("usage") or {}, owners))
         return result
+
+    def _next_round(self, questions: Questions) -> list[str] | None:
+        """The owners of the call's groups when the call is the next round, else None."""
+        if len(self.rounds) == len(self._owners):
+            return None
+        owners = self._owners[len(self.rounds)]
+        return owners if list(questions) == [str(i) for i in range(len(owners))] else None
 
 
 def _needs_tournament(question: dict[str, Any]) -> bool:
     return question["type"] == "choice" and len(question["criteria"]) > SHORTLIST_K
 
 
-def _sources(group: dict[str, Any], questions: Questions) -> list[str]:
-    """The caller's questions that a tournament question could have been cut from.
+def _round_owners(questions: Questions) -> list[list[str]]:
+    """For each elimination round, the caller's question that each of its groups was cut from.
 
-    predict_tournament cuts a narrowed choice's criteria to a subset and keeps its other fields,
-    so a source needs the tournament, has the same other fields and has every label of the group.
-    Identical sources cannot be told apart, so all of them are returned. Only choices are cut,
-    and only their labels are sure to be strings (a score level may be an object).
+    owners[r][i] owns group str(i) of round r. This is how laya-mlx 0.4.0's predict_tournament
+    numbers them: a round's groups follow the order of the request's choices, with each choice's
+    groups next to each other. A choice of n labels gets ceil(n / SHORTLIST_K) groups while that
+    is more than one, and each group sends one label on to the next round. Two choices with the
+    same instructions can have groups with the same labels, so only the position of a group tells
+    which choice it was cut from.
     """
-    if group.get("type") != "choice":
-        return []
-    labels = set(group["criteria"])
-    fields = _without_criteria(group)
-    return [
-        qid
-        for qid, question in questions.items()
-        if _needs_tournament(question)
-        and _without_criteria(question) == fields
-        and labels <= set(question["criteria"])
-    ]
-
-
-def _without_criteria(question: dict[str, Any]) -> dict[str, Any]:
-    return {key: value for key, value in question.items() if key != "criteria"}
+    left = {qid: len(q["criteria"]) for qid, q in questions.items() if q["type"] == "choice"}
+    rounds: list[list[str]] = []
+    while True:
+        groups = {qid: -(-n // SHORTLIST_K) for qid, n in left.items()}
+        owners = [qid for qid, count in groups.items() if count > 1 for _ in range(count)]
+        if not owners:
+            return rounds
+        rounds.append(owners)
+        left = {qid: count for qid, count in groups.items() if count > 1}
 
 
 def _with_round_warnings(
-    usage: dict[str, Any], rounds: list[tuple[Questions, dict[str, Any]]], questions: Questions
+    usage: dict[str, Any],
+    rounds: list[tuple[Questions, dict[str, Any], list[str]]],
+    questions: Questions,
 ) -> dict[str, Any]:
     """The final call's usage, plus the truncation and collapsed options of the rounds before it.
 
-    Token counts stay the final call's. A round names its groups, so each group's warning goes to
-    the caller's question the group was cut from.
+    Token counts stay the final call's. Each group's warning goes to the caller's question that
+    owns the group.
     """
     merged = dict(usage)
-    round_usages = [round_usage for _, round_usage in rounds]
+    round_usages = [round_usage for _, round_usage, _ in rounds]
     if any(round_usage.get("truncated") for round_usage in round_usages):
         truncating = [u for u in [*round_usages, usage] if u.get("truncated")]
         cut = set(usage.get("truncated_questions") or ())
-        for call, round_usage in rounds:
+        for _call, round_usage, owners in rounds:
             for gid in round_usage.get("truncated_questions") or ():
-                cut.update(_sources(call[gid], questions))
+                cut.add(owners[int(gid)])
         merged.update(
             truncated=True,
             truncated_questions=[qid for qid in questions if qid in cut],
             state_tokens=max(u.get("state_tokens", 0) for u in truncating),
             state_tokens_dropped=max(u.get("state_tokens_dropped", 0) for u in truncating),
         )
-    collapsed = _round_collapses(rounds, questions)
+    collapsed = _round_collapses(rounds)
     if collapsed:
         merged["options"] = {**(usage.get("options") or {}), **collapsed}
     return merged
 
 
 def _round_collapses(
-    rounds: list[tuple[Questions, dict[str, Any]]], questions: Questions
+    rounds: list[tuple[Questions, dict[str, Any], list[str]]],
 ) -> dict[str, dict[str, int]]:
     """Each caller question whose groups collapsed, summed over all its groups in that round.
 
@@ -306,43 +314,35 @@ def _round_collapses(
     option the round saw. The first round that collapsed a question wins, since it saw the most.
     """
     found: dict[str, dict[str, int]] = {}
-    for call, round_usage in rounds:
+    for call, round_usage, round_owners in rounds:
         options = round_usage.get("options") or {}
-        if not options:
-            continue
-        sources = {gid: _sources(group, questions) for gid, group in call.items()}
-        hit = {qid for gid in options for qid in sources[gid]}
-        for qid in questions:
+        hit = {round_owners[int(gid)] for gid in options}
+        for qid in dict.fromkeys(round_owners):
             if qid not in hit or qid in found:
                 continue
-            total = distinct = 0
-            for gid, group in call.items():
-                if qid in sources[gid]:
-                    entry = options.get(gid, {})
-                    total += entry.get("total", len(group["criteria"]))
-                    distinct += entry.get("distinct", len(group["criteria"]))
-            found[qid] = {"total": total, "distinct": distinct}
+            groups = [str(i) for i, owner in enumerate(round_owners) if owner == qid]
+            found[qid] = {
+                key: sum(
+                    options.get(gid, {}).get(key, len(call[gid]["criteria"])) for gid in groups
+                )
+                for key in ("total", "distinct")
+            }
     return found
 
 
-def _renamed(error: ValueError, call: Questions, questions: Questions) -> ValueError | None:
-    """The error naming the caller's question when it names a tournament group, else None.
+def _renamed(error: ValueError, owners: list[str]) -> ValueError | None:
+    """A round's error naming the caller's question in place of a group, or None if it names none.
 
-    laya-mlx starts a question's error with "Question <id>". In the final call that id is the
-    caller's own: the question is either unchanged or cut from the caller's question of that id.
+    laya-mlx starts a question's error with "Question <id>", and a round's questions are its groups.
     """
     message = str(error)
-    for gid, group in call.items():
-        prefix = f"Question {gid!r}"
-        if not message.startswith(prefix):
-            continue
-        sources = _sources(group, questions)
-        if not sources or gid in sources or group == questions.get(gid):
-            return None
-        named = " or ".join(repr(qid) for qid in sources)
-        return ValueError(
-            f"Question {named}{message[len(prefix) :]} (it was narrowed in groups of {SHORTLIST_K})"
-        )
+    for i, qid in enumerate(owners):
+        prefix = f"Question {str(i)!r}"
+        if message.startswith(prefix):
+            return ValueError(
+                f"Question {qid!r}{message[len(prefix) :]} "
+                f"(it was narrowed in groups of {SHORTLIST_K})"
+            )
     return None
 
 

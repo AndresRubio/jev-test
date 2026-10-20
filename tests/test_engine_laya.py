@@ -375,6 +375,42 @@ def test_warnings_from_the_final_call_alone_are_kept_as_reported(monkeypatch):
     }
 
 
+# Two choices with the same instructions, where every label of "a" is also a label of "b": only a
+# group's position in its round tells which of the two it was cut from. The round has groups
+# o0..o14 and o15..o29 of "a", then o0..o19 and o20..o39 of "b".
+LOOKALIKES = {"a": choice(30), "b": choice(40)}
+
+
+def test_a_cut_state_in_a_round_warns_only_the_question_its_groups_came_from(monkeypatch):
+    engine, routers, _ = make_engine(monkeypatch)
+    routers[0].usage_for = laya_usage(
+        truncates=lambda question: 50 if len(question.get("criteria", ())) == 15 else 0
+    )
+    result = engine.decide("x", LOOKALIKES, "auto")
+    assert result.usage["truncated_questions"] == ["a"]
+
+
+def test_collapsed_options_in_a_round_count_only_for_the_question_their_groups_came_from(
+    monkeypatch,
+):
+    engine, routers, _ = make_engine(monkeypatch)
+    routers[0].usage_for = laya_usage(
+        collapses=lambda question: 3 if len(question["criteria"]) == 15 else 0
+    )
+    result = engine.decide("x", LOOKALIKES, "auto")
+    assert result.usage["options"] == {"a": {"total": 30, "distinct": 24}}
+
+
+def test_a_round_error_names_only_the_question_its_group_came_from(monkeypatch):
+    engine, routers, _ = make_engine(monkeypatch)
+    routers[0].too_many_options = lambda question: len(question.get("criteria", ())) == 15
+    with pytest.raises(ValueError) as info:
+        engine.decide("x", LOOKALIKES, "auto")
+    assert str(info.value) == (
+        "Question 'a' has too many options for the token budget (it was narrowed in groups of 20)"
+    )
+
+
 def test_non_finite_outputs_are_retried_in_float32(monkeypatch):
     engine, routers, _ = make_engine(monkeypatch)
     routers[0].fail_next = FloatingPointError("nan")
