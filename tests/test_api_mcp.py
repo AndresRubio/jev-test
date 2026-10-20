@@ -1,7 +1,10 @@
+import dataclasses
+
 import pytest
 from mcp import Client
 
 from local_jev.api_mcp import build_mcp_server
+from local_jev.config import Settings
 from local_jev.service import DecisionService
 from tests.fakes import FakeEngine
 
@@ -102,6 +105,20 @@ async def test_decide_batch_applies_the_token_window_to_each_item_and_chunk(serv
 
 
 @pytest.mark.anyio
+async def test_decide_batch_states_the_time_limit_the_config_sets(settings):
+    batch = dataclasses.replace(settings.batch, timeout_seconds=120.0)
+    svc = DecisionService(dataclasses.replace(settings, batch=batch), FakeEngine())
+    try:
+        text = (await listed(svc))["decide_batch"]
+    finally:
+        svc.runtime.shutdown()
+        svc.log.close()
+    # At about 8 long items per second, with a sixth of the time left for waiting in the queue.
+    assert "must finish within 120 seconds" in text
+    assert "more than about 800 long items" in text
+
+
+@pytest.mark.anyio
 async def test_status_names_what_it_reports(service):
     text = (await listed(service))["status"].lower()
     assert [term for term in STATUS_TERMS if term not in text] == []
@@ -146,6 +163,7 @@ class RecordingService:
     """Stands in for DecisionService and keeps every body decide_batch is given."""
 
     def __init__(self):
+        self.settings = Settings()
         self.calls = []
 
     async def decide_batch(self, body, *, interface):

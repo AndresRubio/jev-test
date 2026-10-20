@@ -46,20 +46,40 @@ questions maps an id to one of:
 model: "auto" (routes by language), "english", "multilingual" or "typed-decisions"."""
 )
 
-BATCH_DESCRIPTION = (
-    """Ask the same questions (at most 8, same format as decide) about many items, and get counts, the top matches and a results file, without the items entering your context.
+BATCH_INTRO = """Ask the same questions (at most 8, same format as decide) about many items, and get counts, the top matches and a results file, without the items entering your context.
 
 Give exactly one of:
 - path: absolute path to a local file. format: "jsonl" (one JSON object per line; field = dotted path to the text), "csv" (field = column), "lines" (one item per non-empty line), "chunks" (a long text split into pieces of about chunk_tokens tokens, with line ranges) or "auto" (by file extension).
 - items: a short inline list of states.
 
-filter (optional): {"question": id, "op": ">=" | "<=" | "==", "value": ...}. noul compares P(true), score compares the expected level, choice needs op "==" and one of its labels. matches holds up to top_k items. With a filter they are the items that pass it, most confident first (by the filter question's answer_confidence); without a filter they are the first top_k items in input order. summary counts answers per question; output_path is a JSONL file with every item's answers. On this Mac, expect about 47 short items per second with one question, about 30 with two questions and about 8 for items of about 430 tokens. A batch must finish within 300 seconds or it fails with a timeout error that says how many items were done, so split files of more than about 2,000 long items.
+filter (optional): {"question": id, "op": ">=" | "<=" | "==", "value": ...}. noul compares P(true), score compares the expected level, choice needs op "==" and one of its labels. matches holds up to top_k items. With a filter they are the items that pass it, most confident first (by the filter question's answer_confidence); without a filter they are the first top_k items in input order. summary counts answers per question; output_path is a JSONL file with every item's answers. On this Mac, expect about 47 short items per second with one question, about 30 with two questions and about 8 for items of about 430 tokens."""
+
+BATCH_TAIL = (
+    """
 
 Each item is read like a decide state, so the rules below apply to every item. The token window in the rules applies to each item and, with format "chunks", to each chunk: keep chunk_tokens below it.
 
 """
     + RULES
 )
+
+LONG_ITEMS_PER_SECOND = 8  # items of about 430 tokens with one question, from docs/benchmarks.md
+
+
+def batch_description(timeout_seconds: float) -> str:
+    """The decide_batch description for this batch.timeout_seconds.
+
+    The time a batch waits behind other requests counts against the limit too, so the number of
+    long items to split at leaves a sixth of the time for that wait.
+    """
+    long_items = round(timeout_seconds * LONG_ITEMS_PER_SECOND * 5 / 6, -1)
+    limit = (
+        f" A batch must finish within {timeout_seconds:g} seconds or it fails with a timeout error"
+        " that says how many items were done, so split files of more than about"
+        f" {long_items:,.0f} long items."
+    )
+    return BATCH_INTRO + limit + BATCH_TAIL
+
 
 STATUS_DESCRIPTION = (
     "Report the backend, its loaded and ready checkpoints and any still downloading, approximate peak memory in MB, "
@@ -83,7 +103,7 @@ def build_mcp_server(service: Any) -> MCPServer:
             )
         )
 
-    @mcp.tool(description=BATCH_DESCRIPTION)
+    @mcp.tool(description=batch_description(service.settings.batch.timeout_seconds))
     async def decide_batch(
         questions: dict[str, dict[str, Any]],
         path: str | None = None,
