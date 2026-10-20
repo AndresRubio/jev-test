@@ -1,4 +1,5 @@
 import functools
+import io
 import json
 import logging
 import os
@@ -410,21 +411,47 @@ def test_serve_port_option_reaches_the_app_and_the_server(monkeypatch):
     assert seen == {"app": 7800, "server": 7800}
 
 
-def test_logging_goes_to_a_rotating_server_log_and_to_stderr(monkeypatch, tmp_path):
+class Terminal(io.StringIO):
+    """A stderr that says it is a terminal."""
+
+    def isatty(self):
+        return True
+
+
+@contextmanager
+def logging_handlers(monkeypatch, tmp_path, stderr):
+    """The handlers _configure_logging sets up while sys.stderr is `stderr`, closed afterwards."""
     configured = {}
+    monkeypatch.setattr(sys, "stderr", stderr)
     monkeypatch.setattr(logging, "basicConfig", lambda **kwargs: configured.update(kwargs))
     cli._configure_logging(tmp_path / "logs")
-    file_handler, stream_handler = configured["handlers"]
     try:
         assert configured["level"] == logging.INFO
+        yield configured["handlers"]
+    finally:
+        for handler in configured["handlers"]:
+            handler.close()
+
+
+def test_logging_goes_to_a_rotating_server_log_and_to_a_terminal(monkeypatch, tmp_path):
+    terminal = Terminal()
+    with logging_handlers(monkeypatch, tmp_path, terminal) as handlers:
+        file_handler, stream_handler = handlers
         assert isinstance(file_handler, RotatingFileHandler)
         assert Path(file_handler.baseFilename) == tmp_path / "logs" / "server.log"
         assert (file_handler.maxBytes, file_handler.backupCount) == (10 * 1024 * 1024, 5)
         assert type(stream_handler) is logging.StreamHandler
+        assert stream_handler.stream is terminal
         record = logging.LogRecord("local_jev.x", logging.INFO, __file__, 1, "started", None, None)
         assert " INFO local_jev.x: started" in file_handler.format(record)
-    finally:
-        file_handler.close()
+
+
+def test_logging_goes_only_to_the_server_log_when_stderr_is_not_a_terminal(monkeypatch, tmp_path):
+    # Under launchd stderr is launchd.err.log, which never rotates, so it must not get every line.
+    with logging_handlers(monkeypatch, tmp_path, io.StringIO()) as handlers:
+        [file_handler] = handlers
+        assert isinstance(file_handler, RotatingFileHandler)
+        assert Path(file_handler.baseFilename) == tmp_path / "logs" / "server.log"
 
 
 # the agent
@@ -706,23 +733,60 @@ def test_only_yes_confirms(monkeypatch, answer, status):
     assert cli.main(["uninstall-agent"]) == status
 
 
+@pytest.mark.parametrize(
+    ("config", "env"),
+    [("port = 80\n", {}), ("port = [\n", {}), ("", {"LOCAL_JEV_PORT": "80"})],
+    ids=["bad value", "bad toml", "bad variable"],
+)
+def test_uninstall_agent_works_while_the_settings_are_broken(
+    monkeypatch, tmp_path, capsys, config, env
+):
+    # A config error makes the login agent exit, and launchd starts it again every 10 seconds.
+    (tmp_path / "none.toml").write_text(config)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setattr(cli.launchd, "uninstall", lambda: True)
+    assert cli.main(["uninstall-agent", "--yes"]) == 0
+    assert capsys.readouterr().out == "removed the login agent\n"
+    assert cli.main(["status"]) == 2  # every other command still stops on the config error
+
+
 # connect
 
 
 def test_connect_cursor_snippet(capsys, monkeypatch):
     monkeypatch.setenv("LOCAL_JEV_PORT", "7800")
     assert cli.main(["connect", "--harness", "cursor"]) == 0
-    first, _, body = capsys.readouterr().out.partition("\n")
-    assert first == "// add to ~/.cursor/mcp.json"
-    assert json.loads(body) == {"mcpServers": {"local-jev": {"url": "http://127.0.0.1:7800/mcp"}}}
+    captured = capsys.readouterr()
+    # The comment goes to stderr, so the whole of stdout can be pasted as JSON.
+    assert captured.err == "// add to ~/.cursor/mcp.json\n"
+    assert json.loads(captured.out) == {
+        "mcpServers": {"local-jev": {"url": "http://127.0.0.1:7800/mcp"}}
+    }
+
+
+def test_connect_cursor_snippet_has_cursor_read_the_token_from_the_environment(capsys, monkeypatch):
+    # Cursor fills in ${env:NAME} itself, so the token stays out of mcp.json.
+    monkeypatch.setenv("LOCAL_JEV_TOKEN", "s3cret")
+    assert cli.main(["connect", "--harness", "cursor"]) == 0
+    captured = capsys.readouterr()
+    assert captured.err == "// add to ~/.cursor/mcp.json\n"
+    assert json.loads(captured.out) == {
+        "mcpServers": {
+            "local-jev": {
+                "url": "http://127.0.0.1:7711/mcp",
+                "headers": {"Authorization": "Bearer ${env:LOCAL_JEV_TOKEN}"},
+            }
+        }
+    }
 
 
 def test_connect_json_snippet_names_the_token_variable_without_its_value(capsys, monkeypatch):
     monkeypatch.setenv("LOCAL_JEV_TOKEN", "s3cret")
     assert cli.main(["connect", "--harness", "json"]) == 0
-    first, _, body = capsys.readouterr().out.partition("\n")
-    assert first == "// add to your agent's MCP configuration"
-    assert json.loads(body) == {
+    captured = capsys.readouterr()
+    assert captured.err == "// add to your agent's MCP configuration\n"
+    assert json.loads(captured.out) == {
         "mcpServers": {
             "local-jev": {
                 "type": "http",
@@ -733,11 +797,25 @@ def test_connect_json_snippet_names_the_token_variable_without_its_value(capsys,
     }
 
 
+def test_connect_codex_snippet_is_printed_whole_on_stdout(capsys, monkeypatch):
+    monkeypatch.setenv("LOCAL_JEV_TOKEN", "s3cret")
+    assert cli.main(["connect", "--harness", "codex"]) == 0
+    captured = capsys.readouterr()
+    assert captured.out == (
+        "# add to ~/.codex/config.toml\n"
+        "[mcp_servers.local-jev]\n"
+        'url = "http://127.0.0.1:7711/mcp"\n'
+        'bearer_token_env_var = "LOCAL_JEV_TOKEN"\n'
+    )
+    assert captured.err == ""
+
+
 @pytest.mark.parametrize("harness", ["codex", "cursor", "json"])
 def test_no_snippet_prints_the_token(capsys, monkeypatch, harness):
     monkeypatch.setenv("LOCAL_JEV_TOKEN", "s3cret")
     assert cli.main(["connect", "--harness", harness]) == 0
-    assert "s3cret" not in capsys.readouterr().out
+    captured = capsys.readouterr()
+    assert "s3cret" not in captured.out + captured.err
 
 
 def test_connect_codex_snippet_reads_the_token_from_the_environment(capsys, monkeypatch):

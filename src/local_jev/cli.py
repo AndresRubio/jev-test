@@ -28,6 +28,10 @@ HF_ENV_VARS = ("HF_HOME", "HF_HUB_CACHE")
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.handler is cmd_uninstall_agent:
+        # It reads no setting. A config error makes the login agent exit and launchd start it
+        # again every 10 seconds, so removing that agent must not depend on the config.
+        return cmd_uninstall_agent(args)
     try:
         settings = load_settings()
     except ConfigError as exc:
@@ -196,13 +200,15 @@ def cmd_connect(args: argparse.Namespace, settings: Settings) -> int:
             lines.append('bearer_token_env_var = "LOCAL_JEV_TOKEN"')
         print("\n".join(lines))
         return 0
-    server: dict[str, Any] = (
-        {"url": url} if args.harness == "cursor" else {"type": "http", "url": url}
-    )
+    cursor = args.harness == "cursor"
+    server: dict[str, Any] = {"url": url} if cursor else {"type": "http", "url": url}
     if settings.token:
-        server["headers"] = {"Authorization": "Bearer <your LOCAL_JEV_TOKEN>"}
-    where = "~/.cursor/mcp.json" if args.harness == "cursor" else "your agent's MCP configuration"
-    print(f"// add to {where}")
+        # Cursor fills in ${env:NAME} itself, which keeps the token out of mcp.json.
+        token = "${env:LOCAL_JEV_TOKEN}" if cursor else "<your LOCAL_JEV_TOKEN>"
+        server["headers"] = {"Authorization": f"Bearer {token}"}
+    where = "~/.cursor/mcp.json" if cursor else "your agent's MCP configuration"
+    # The comment goes to stderr, so stdout is JSON that can be pasted or piped as it is.
+    print(f"// add to {where}", file=sys.stderr)
     print(json.dumps({"mcpServers": {"local-jev": server}}, indent=2))
     return 0
 
@@ -245,7 +251,7 @@ def cmd_install_agent(args: argparse.Namespace, settings: Settings) -> int:
     return 0
 
 
-def cmd_uninstall_agent(args: argparse.Namespace, settings: Settings) -> int:
+def cmd_uninstall_agent(args: argparse.Namespace) -> int:
     if not (args.yes or _confirm("Stop local-jev and remove the login agent?")):
         print("cancelled")
         return 1
@@ -360,4 +366,8 @@ def _configure_logging(log_dir: Path) -> None:
         log_dir / "server.log", maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8"
     )
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
-    logging.basicConfig(level=logging.INFO, handlers=[handler, logging.StreamHandler()])
+    handlers: list[logging.Handler] = [handler]
+    # Under launchd stderr is launchd.err.log, which never rotates, so only a terminal gets a copy.
+    if sys.stderr.isatty():
+        handlers.append(logging.StreamHandler())
+    logging.basicConfig(level=logging.INFO, handlers=handlers)

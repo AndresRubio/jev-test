@@ -52,7 +52,11 @@ def temporary_server(**env_overrides: str) -> Iterator[tuple[str, subprocess.Pop
             except httpx2.HTTPError:
                 pass
             if process.poll() is not None or time.monotonic() > deadline:
-                raise RuntimeError(f"the server did not start; see {workdir / 'stderr.log'}")
+                # stderr is a file, not a terminal, so the server logs only to logs/server.log.
+                raise RuntimeError(
+                    f"the server did not start; see {workdir / 'logs' / 'server.log'}"
+                    f" and {workdir / 'stderr.log'}"
+                )
             time.sleep(0.2)
         yield base, process
     finally:
