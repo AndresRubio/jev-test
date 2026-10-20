@@ -29,6 +29,40 @@ DEPT = {
     }
 }
 UPGRADE = "I would like to upgrade to the premium plan. What does it cost?"
+TOPICS = {f"topic_{i}": f"questions about unrelated topic number {i}" for i in range(29)}
+TOPICS["billing"] = "invoices, payments and refunds"
+DEPARTMENTS = {
+    "billing": "invoices, payments and refunds",
+    "shipping": "delivery times, tracking, lost parcels",
+    "technical_support": "bugs, crashes, error messages",
+    "account_access": "login problems, password resets, two-factor codes",
+    "sales": "new purchases, upgrades, pricing quotes",
+    "cancellations": "closing an account or ending a subscription",
+    "privacy": "personal data requests and GDPR",
+    "security": "hacked accounts, phishing, suspicious activity",
+    "feedback": "suggestions and compliments",
+    "partnerships": "business partnerships, affiliates, resellers",
+    "careers": "job applications and internships",
+    "press": "media and press inquiries",
+    "legal": "contracts, terms of service, disputes",
+    "onboarding": "getting started and setup help",
+    "integrations": "API, webhooks, third-party apps",
+    "hardware": "devices, chargers, physical damage",
+    "warranty": "repairs under warranty",
+    "marketing": "newsletters, promotions, unsubscribing",
+    "accessibility": "screen readers and accessibility features",
+    "localization": "language and regional settings",
+    "education": "training courses, webinars, certifications",
+    "events": "conferences, meetups, tickets",
+    "donations": "charity and sponsorship requests",
+    "data_export": "downloading or migrating data",
+    "performance": "slow loading, timeouts, latency",
+    "mobile_app": "iOS and Android app issues",
+    "notifications": "email or push notification settings",
+    "gift_cards": "buying or redeeming gift cards",
+    "complaints": "complaints about staff or service quality",
+    "returns": "sending products back for an exchange",
+}
 
 
 @pytest.fixture(scope="module")
@@ -73,17 +107,27 @@ def test_a_long_state_reports_truncation(engine):
     assert response["answers"]["q"]["warnings"][0].startswith("state_truncated:")
 
 
-def test_more_than_20_options_are_shortlisted(engine):
-    criteria = {f"topic_{i}": f"questions about unrelated topic number {i}" for i in range(29)}
-    criteria["billing"] = "invoices, payments and refunds"
-    questions = {
-        "q": {"type": "choice", "instructions": "Which topic is this?", "criteria": criteria}
-    }
+@pytest.mark.parametrize(
+    ("instructions", "criteria"),
+    [
+        ("Which topic is this?", TOPICS),
+        ("Which department should handle this?", TOPICS),
+        ("Which department should handle this?", DEPARTMENTS),
+    ],
+    ids=["topics", "topics-by-department", "departments"],
+)
+def test_more_than_20_options_are_shortlisted(engine, instructions, criteria):
+    questions = {"q": {"type": "choice", "instructions": instructions, "criteria": criteria}}
     result = engine.decide("I was billed twice, please refund one invoice.", questions, "english")
     meta = result.shortlist["q"]
     assert meta["passthrough"] is False
-    assert len(meta["labels"]) == 20
     assert meta["n"] == 30
+    answer = finalize(result, questions, backend="laya-mlx", latency_ms=0.0)["answers"]["q"]
+    kept = answer["shortlisted"]["kept"]
+    assert answer["choice"] == "billing"
+    assert "billing" in kept
+    assert answer["shortlisted"]["dropped"] == 30 - len(kept)
+    assert answer["warnings"][0].startswith("shortlisted:")
 
 
 @pytest.mark.anyio

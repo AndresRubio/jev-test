@@ -48,18 +48,16 @@ class LayaMLXEngine:
         *,
         cache_dir: Path | None = None,
         router_factory: Callable[[Path, str], Any] = default_router_factory,
-        shortlist_fn: Callable[..., dict[str, Any]] | None = None,
-        embed_factory: Callable[[Any], Any] | None = None,
+        tournament_fn: Callable[..., dict[str, Any]] | None = None,
         tokenizer_factory: Callable[[Path], Any] = default_tokenizer_factory,
     ) -> None:
         self._settings = settings
         self._cache_dir = cache_dir
         self._root = checkpoints.snapshot_root(settings.repo, settings.revision, cache_dir)
         self._router_factory = router_factory
-        self._shortlist = shortlist_fn or (
-            lambda *args, **kwargs: _laya().predict_shortlist(*args, **kwargs)
+        self._tournament = tournament_fn or (
+            lambda *args, **kwargs: _laya().predict_tournament(*args, **kwargs)
         )
-        self._embed_factory = embed_factory or (lambda agent: _laya().embed_fn_from_agent(agent))
         self._tokenizer_factory = tokenizer_factory
         self._router = router_factory(self._root, settings.dtype)
         self._lock = threading.Lock()
@@ -80,7 +78,7 @@ class LayaMLXEngine:
             model=f"laya-{name}",
             checkpoint=name,
             routing_reason=reason,
-            shortlist=raw.get("shortlist", {}),
+            shortlist=_narrowed(raw.get("tournament", {})),
         )
 
     def count_tokens(self, text: str, model: str) -> int:
@@ -119,7 +117,10 @@ class LayaMLXEngine:
         return bool(self._router.loaded)
 
     def unload(self) -> None:
+        """Free the checkpoints and the tokenizers count_tokens cached; each is rebuilt on next use."""
         self._router.unload()
+        with self._lock:
+            self._tokenizers.clear()
 
     def status(self) -> dict[str, Any]:
         with self._lock:
@@ -169,25 +170,26 @@ class LayaMLXEngine:
     def _predict(
         self, router: Any, state: Any, questions: dict[str, dict[str, Any]], name: str
     ) -> dict[str, Any]:
-        agent = self._load(router, name)
+        self._load(router, name)
         if any(
             q["type"] == "choice" and len(q["criteria"]) > SHORTLIST_K for q in questions.values()
         ):
-            embed = self._embed_factory(agent)
-            return self._shortlist(router, state, questions, embed, k=SHORTLIST_K, model=name)
+            # The group size equals the threshold, so a choice of 20 or fewer options in the same
+            # request reaches the final call whole.
+            return self._tournament(router, state, questions, group_size=SHORTLIST_K, model=name)
         return router.predict(state, questions, model=name)
 
     @staticmethod
-    def _load(router: Any, name: str) -> Any:
+    def _load(router: Any, name: str) -> None:
         """Build the checkpoint's Agent before predicting, so a failure to build it is a 503.
 
         laya-mlx raises a plain ValueError (a config it rejects) or OSError (a missing file) when
         it cannot build an Agent. Left alone, those reach the service as a bad request and the
         caller is told their questions are wrong. The Router keeps the Agent it built, so the
-        predict() that follows reuses it.
+        predict() calls that follow reuse it.
         """
         try:
-            return router.load(name)
+            router.load(name)
         except (ValueError, OSError) as exc:
             raise ModelUnavailable(
                 f"the {name} checkpoint failed to load: {exc}", LOAD_HINT
@@ -206,3 +208,20 @@ class LayaMLXEngine:
             ) from exc
         finally:
             router.unload()
+
+
+def _narrowed(tournament: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """The choices the tournament narrowed, in the shortlist shape guard.finalize reads.
+
+    A choice that needed no round (rounds == 0) went to the final call whole, so it is left out.
+    """
+    return {
+        qid: {
+            "labels": list(entry["labels"]),
+            "n": entry["n"],
+            "passthrough": False,
+            "rounds": entry["rounds"],
+        }
+        for qid, entry in tournament.items()
+        if entry["rounds"] > 0
+    }

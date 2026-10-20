@@ -125,31 +125,20 @@ def test_truncation_and_collapsed_options_become_warnings():
 def test_shortlist_metadata_is_reported():
     engine = FakeEngine(
         shortlist={
-            "dept": {
-                "labels": ["billing", "tech"],
-                "scores": [0.9, 0.5],
-                "k": 2,
-                "n": 30,
-                "passthrough": False,
-            }
+            "dept": {"labels": ["billing", "tech"], "n": 30, "passthrough": False, "rounds": 1}
         }
     )
     dept = run(engine)["answers"]["dept"]
     assert dept["shortlisted"] == {"kept": ["billing", "tech"], "dropped": 28}
-    assert dept["warnings"][0].startswith("shortlisted: 30 options were narrowed to the 2")
+    assert dept["warnings"] == [
+        "shortlisted: 30 options were narrowed to 2 finalists by elimination rounds; "
+        "probabilities cover only those"
+    ]
 
 
 def test_a_passthrough_shortlist_is_silent():
     engine = FakeEngine(
-        shortlist={
-            "dept": {
-                "labels": ["billing", "tech"],
-                "scores": None,
-                "k": 20,
-                "n": 2,
-                "passthrough": True,
-            }
-        }
+        shortlist={"dept": {"labels": ["billing", "tech"], "n": 2, "passthrough": True}}
     )
     dept = run(engine)["answers"]["dept"]
     assert "shortlisted" not in dept

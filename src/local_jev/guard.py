@@ -73,7 +73,7 @@ def finalize(
             kept = list(meta["labels"])
             answer["shortlisted"] = {"kept": kept, "dropped": int(meta["n"]) - len(kept)}
             warnings.append(
-                f"shortlisted: {meta['n']} options were narrowed to the {len(kept)} most similar to the input; "
+                f"shortlisted: {meta['n']} options were narrowed to {len(kept)} finalists by elimination rounds; "
                 "probabilities cover only those"
             )
         answer["warnings"] = warnings

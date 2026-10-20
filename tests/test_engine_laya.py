@@ -1,3 +1,5 @@
+import weakref
+
 import pytest
 
 from local_jev.config import LayaSettings
@@ -6,6 +8,10 @@ from local_jev.engines.laya_mlx import LayaMLXEngine
 from local_jev.errors import ModelUnavailable, NotDownloaded
 
 NOUL = {"q": {"type": "noul", "instructions": "Does the customer ask for money back?"}}
+
+
+def choice(count):
+    return {"type": "choice", "instructions": "Which?", "criteria": [f"o{i}" for i in range(count)]}
 
 
 class FakeRouter:
@@ -60,6 +66,40 @@ class FakeRouter:
 
     def unload(self, name=None):
         self.loaded = []
+
+
+class FakeTournament:
+    """Stands in for laya_mlx.predict_tournament: a choice above group_size keeps its first two labels.
+
+    group_size defaults to 16 as in laya-mlx, so a call without group_size=20 also narrows a
+    choice of 17 to 20 options.
+    """
+
+    def __init__(self):
+        self.calls: list[dict] = []
+
+    def __call__(self, router, state, questions, group_size=16, **predict_kwargs):
+        self.calls.append(
+            {"router": router, "state": state, "questions": questions, "group_size": group_size}
+            | predict_kwargs
+        )
+        tournament, final = {}, dict(questions)
+        for qid, question in questions.items():
+            if question["type"] != "choice":
+                continue
+            labels, rounds = list(question["criteria"]), 0
+            if len(labels) > group_size:
+                labels, rounds = labels[:2], 1
+                final[qid] = dict(question, criteria=labels)
+            tournament[qid] = {"labels": labels, "n": len(question["criteria"]), "rounds": rounds}
+        result = router.predict(state, final, **predict_kwargs)
+        result["tournament"] = tournament
+        return result
+
+
+class FakeTokenizer:
+    def encode(self, text, add_special_tokens=False):
+        return type("Encoding", (), {"ids": text.split()})()
 
 
 def make_engine(monkeypatch, *, fail_dtypes=(), load_errors=None, **kwargs):
@@ -142,36 +182,61 @@ def test_a_checkpoint_still_downloading_asks_to_retry(monkeypatch):
         engine.decide("x", NOUL, "auto")
 
 
-def test_more_than_20_options_are_shortlisted(monkeypatch):
-    calls = []
+def test_twenty_options_take_the_direct_path(monkeypatch):
+    engine, routers, _ = make_engine(
+        monkeypatch, tournament_fn=lambda *a, **k: pytest.fail("must not run a tournament")
+    )
+    twenty = {"q": choice(20)}
+    result = engine.decide("x", twenty, "auto")
+    assert routers[0].predictions == [("x", twenty, "english")]
+    assert result.shortlist == {}
 
-    def fake_shortlist(router, state, questions, embed, *, k, model):
-        calls.append((k, model, embed))
+
+def test_more_than_20_options_go_through_the_tournament(monkeypatch):
+    tournament = FakeTournament()
+    engine, routers, _ = make_engine(monkeypatch, tournament_fn=tournament)
+    questions = {"q": choice(21)}
+    result = engine.decide("x", questions, "auto")
+    assert tournament.calls == [
+        {
+            "router": routers[0],
+            "state": "x",
+            "questions": questions,
+            "group_size": 20,
+            "model": "english",
+        }
+    ]
+    assert result.shortlist == {
+        "q": {"labels": ["o0", "o1"], "n": 21, "passthrough": False, "rounds": 1}
+    }
+
+
+def test_only_choices_the_tournament_narrowed_are_shortlisted(monkeypatch):
+    def tournament(router, state, questions, *, group_size, model):
         result = router.predict(state, questions, model=model)
-        result["shortlist"] = {
-            "q": {"labels": ["o0"], "scores": [0.9], "k": k, "n": 25, "passthrough": False}
+        result["tournament"] = {
+            "big": {"labels": ["o4", "o29"], "n": 30, "rounds": 1},
+            "small": {"labels": [f"o{i}" for i in range(17)], "n": 17, "rounds": 0},
         }
         return result
 
-    engine, _, _ = make_engine(
-        monkeypatch, shortlist_fn=fake_shortlist, embed_factory=lambda agent: f"embed:{agent}"
-    )
-    many = {
-        "q": {"type": "choice", "instructions": "Which?", "criteria": [f"o{i}" for i in range(25)]}
+    engine, _, _ = make_engine(monkeypatch, tournament_fn=tournament)
+    result = engine.decide("x", {"big": choice(30), "small": choice(17)}, "auto")
+    assert result.shortlist == {
+        "big": {"labels": ["o4", "o29"], "n": 30, "passthrough": False, "rounds": 1}
     }
-    result = engine.decide("x", many, "auto")
-    assert calls == [(20, "english", "embed:agent:english")]
-    assert result.shortlist["q"]["n"] == 25
+    assert set(result.answers) == {"big", "small"}
+    assert result.usage == {"input_tokens": 12, "output_tokens": 0}
 
 
-def test_twenty_options_are_not_shortlisted(monkeypatch):
-    engine, _, _ = make_engine(
-        monkeypatch, shortlist_fn=lambda *a, **k: pytest.fail("must not shortlist")
-    )
-    twenty = {
-        "q": {"type": "choice", "instructions": "Which?", "criteria": [f"o{i}" for i in range(20)]}
-    }
-    assert engine.decide("x", twenty, "auto").shortlist == {}
+def test_a_mixed_request_narrows_only_the_choice_above_20(monkeypatch):
+    tournament = FakeTournament()
+    engine, _, _ = make_engine(monkeypatch, tournament_fn=tournament)
+    questions = {"big": choice(30), "small": choice(17), **NOUL}
+    result = engine.decide("x", questions, "auto")
+    assert len(tournament.calls) == 1
+    assert set(result.shortlist) == {"big"}
+    assert set(result.answers) == {"big", "small", "q"}
 
 
 def test_non_finite_outputs_are_retried_in_float32(monkeypatch):
@@ -187,6 +252,18 @@ def test_float32_failure_is_model_unavailable(monkeypatch):
     engine, _, _ = make_engine(monkeypatch, fail_dtypes=("float16", "float32"))
     with pytest.raises(ModelUnavailable, match="non-finite"):
         engine.decide("x", NOUL, "auto")
+
+
+def test_the_float32_retry_also_runs_the_tournament(monkeypatch):
+    tournament = FakeTournament()
+    engine, routers, _ = make_engine(monkeypatch, tournament_fn=tournament)
+    routers[0].fail_next = FloatingPointError("nan")
+    result = engine.decide("x", {"q": choice(25)}, "auto")
+    assert [router.dtype for router in routers] == ["float16", "float32"]
+    assert [call["router"] for call in tournament.calls] == routers
+    assert [call["group_size"] for call in tournament.calls] == [20, 20]
+    assert result.shortlist["q"]["n"] == 25
+    assert routers[1].loaded == []
 
 
 @pytest.mark.parametrize(
@@ -210,17 +287,14 @@ def test_a_checkpoint_that_fails_to_load_is_model_unavailable(monkeypatch, error
     assert engine.is_loaded() is False
 
 
-def test_a_load_failure_in_the_shortlist_path_is_model_unavailable(monkeypatch):
+def test_a_load_failure_in_the_tournament_path_is_model_unavailable(monkeypatch):
     engine, _, _ = make_engine(
         monkeypatch,
         load_errors={"float16": ValueError("bad config")},
-        shortlist_fn=lambda *a, **k: pytest.fail("must not shortlist"),
+        tournament_fn=lambda *a, **k: pytest.fail("must not run a tournament"),
     )
-    many = {
-        "q": {"type": "choice", "instructions": "Which?", "criteria": [f"o{i}" for i in range(25)]}
-    }
     with pytest.raises(ModelUnavailable, match="failed to load"):
-        engine.decide("x", many, "auto")
+        engine.decide("x", {"q": choice(25)}, "auto")
 
 
 def test_the_float32_retry_that_fails_to_load_is_model_unavailable(monkeypatch):
@@ -268,10 +342,6 @@ def test_unload_and_is_loaded(monkeypatch):
 def test_count_tokens_uses_the_checkpoint_tokenizer(monkeypatch):
     paths = []
 
-    class FakeTokenizer:
-        def encode(self, text, add_special_tokens=False):
-            return type("Encoding", (), {"ids": text.split()})()
-
     def tokenizer_factory(path):
         paths.append(path)
         return FakeTokenizer()
@@ -281,6 +351,23 @@ def test_count_tokens_uses_the_checkpoint_tokenizer(monkeypatch):
     assert engine.count_tokens("again two", "auto") == 2
     assert len(paths) == 1
     assert paths[0].name == "tokenizer.json"
+
+
+def test_unload_frees_the_cached_tokenizers(monkeypatch):
+    built = []
+
+    def tokenizer_factory(path):
+        tokenizer = FakeTokenizer()
+        built.append(weakref.ref(tokenizer))
+        return tokenizer
+
+    engine, _, _ = make_engine(monkeypatch, tokenizer_factory=tokenizer_factory)
+    engine.count_tokens("one", "english")
+    engine.count_tokens("uno", "multilingual")
+    engine.unload()
+    assert [ref() for ref in built] == [None, None]
+    assert engine.count_tokens("one two", "english") == 2
+    assert len(built) == 3
 
 
 def test_status_reports_the_pinned_revision(monkeypatch):
@@ -313,26 +400,19 @@ def test_the_default_router_points_every_checkpoint_at_the_pinned_snapshot(monke
     }
 
 
-def test_the_default_shortlist_and_embedding_come_from_laya_mlx(monkeypatch):
+def test_the_default_tournament_comes_from_laya_mlx(monkeypatch):
     calls = []
 
     class FakeLaya:
         @staticmethod
-        def embed_fn_from_agent(agent):
-            return f"embed:{agent}"
-
-        @staticmethod
-        def predict_shortlist(router, state, questions, embed_fn, k=20, **predict_kwargs):
-            calls.append((embed_fn, k, predict_kwargs))
-            return router.predict(state, questions, **predict_kwargs)
+        def predict_tournament(agent, state, questions, group_size=16, **predict_kwargs):
+            calls.append((agent, group_size, predict_kwargs))
+            return agent.predict(state, questions, **predict_kwargs)
 
     monkeypatch.setattr(engine_module, "_laya", lambda: FakeLaya)
-    engine, _, _ = make_engine(monkeypatch)
-    many = {
-        "q": {"type": "choice", "instructions": "Which?", "criteria": [f"o{i}" for i in range(25)]}
-    }
-    engine.decide("x", many, "auto")
-    assert calls == [("embed:agent:english", 20, {"model": "english"})]
+    engine, routers, _ = make_engine(monkeypatch)
+    engine.decide("x", {"q": choice(25)}, "auto")
+    assert calls == [(routers[0], 20, {"model": "english"})]
 
 
 def test_the_default_tokenizer_factory_loads_a_tokenizer_json(tmp_path):
