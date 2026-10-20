@@ -80,7 +80,9 @@ Differences from Jev:
 
 [docs/benchmarks.md](docs/benchmarks.md) has the speed and memory figures for this Mac, an M1 Pro with 16 GB, and [eval/results.md](eval/results.md) has the accuracy on 60 hand-labelled items in English and Spanish.
 
-On that Mac one short question takes about 23 ms end to end over HTTP, and 10 questions in one call about 110 ms. The first request, which loads the English checkpoint, takes under a second. The process's footprint, as `top` reports it, is about 2,400 MB with both checkpoints loaded and under 300 MB after the idle unload. `decide_batch` gets through about 46 short items per second with one yes/no question, and long items or extra questions lower that rate.
+On that Mac one short question takes about 23 ms end to end over HTTP, and 10 questions in one call about 110 ms. The first request, which loads the English checkpoint, takes under a second. The process's footprint, as `top` reports it, is about 2,400 MB with both checkpoints loaded and under 300 MB after the idle unload.
+
+`decide_batch` gets through about 45 short items per second with one yes/no question, about 29 with two questions and about 8 when each item is about 430 tokens long. A batch has 300 seconds (`batch.timeout_seconds`) for all of its model calls, so it fits about 2,400 of those long items; split a larger file. A batch that runs out of time fails with a `timeout` error (a 504 over REST) that says how many items were done, and it writes no results file.
 
 In the evaluation the model answered 22 of the 30 yes/no questions correctly with its own true/false labels and 24 with neutral A/B labels, so `ab_labels` is the default. It got 16 of the 20 choice questions right, and 7 of the 10 score questions when its most likely level counts as the answer.
 

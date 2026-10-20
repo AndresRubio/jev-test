@@ -53,7 +53,7 @@ Give exactly one of:
 - path: absolute path to a local file. format: "jsonl" (one JSON object per line; field = dotted path to the text), "csv" (field = column), "lines" (one item per non-empty line), "chunks" (a long text split into pieces of about chunk_tokens tokens, with line ranges) or "auto" (by file extension).
 - items: a short inline list of states.
 
-filter (optional): {"question": id, "op": ">=" | "<=" | "==", "value": ...}. noul compares P(true), score compares the expected level, choice needs op "==" and one of its labels. matches holds up to top_k items. With a filter they are the items that pass it, most confident first (by the filter question's answer_confidence); without a filter they are the first top_k items in input order. summary counts answers per question; output_path is a JSONL file with every item's answers. Expect roughly 20-50 items per second per question on this Mac.
+filter (optional): {"question": id, "op": ">=" | "<=" | "==", "value": ...}. noul compares P(true), score compares the expected level, choice needs op "==" and one of its labels. matches holds up to top_k items. With a filter they are the items that pass it, most confident first (by the filter question's answer_confidence); without a filter they are the first top_k items in input order. summary counts answers per question; output_path is a JSONL file with every item's answers. On this Mac, expect about 45 short items per second with one question, about 29 with two questions and about 8 for items of about 430 tokens.
 
 Each item is read like a decide state, so the rules below apply to every item. The token window in the rules applies to each item and, with format "chunks", to each chunk: keep chunk_tokens below it.
 
