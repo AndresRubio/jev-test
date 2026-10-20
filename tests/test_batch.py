@@ -716,6 +716,22 @@ def test_an_inline_item_whose_id_is_not_a_finite_number_goes_by_its_number(liter
     assert [(item.id, item.n) for item in items] == [(1, 1), (2, 2), (2.5, 3)]
 
 
+@pytest.mark.parametrize(
+    "own_id",
+    [[float("nan")], {"a": [1, float("inf")]}, ["x", {"b": float("-inf")}]],
+    ids=["NaN in a list", "infinity in an object", "-infinity deeper down"],
+)
+def test_an_inline_item_whose_id_holds_a_non_finite_number_goes_by_its_number(own_id):
+    # The id is written to the results file, which a NaN anywhere inside it would make invalid.
+    items = load_items(
+        params(items=[{"id": own_id, "text": "a"}, {"id": {"k": [1, 2.5]}, "text": "b"}]),
+        path=None,
+        count_tokens=words,
+        max_items=5,
+    )
+    assert [(item.id, item.n) for item in items] == [(1, 1), ({"k": [1, 2.5]}, 2)]
+
+
 def test_cleanup_removes_old_result_files_and_leaves_the_users_own_files(tmp_path):
     # results_dir may point at a folder that also holds the user's own files.
     results = tmp_path / "results"

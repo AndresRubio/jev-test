@@ -256,10 +256,15 @@ def _lines(text: str) -> Iterator[str]:
 def _own_id(value: Any, fallback: int) -> Any:
     """The item's own id, or its number when it has none or one that no JSON response can hold.
 
-    MCP reads requests with pydantic_core.from_json, which turns NaN and the infinities into floats.
+    MCP reads requests with pydantic_core.from_json, which turns NaN and the infinities into floats,
+    anywhere inside an id that is a list or an object.
     """
     own = value["id"] if isinstance(value, dict) and "id" in value else fallback
-    return fallback if isinstance(own, float) and not math.isfinite(own) else own
+    try:
+        json.dumps(own, allow_nan=False)
+    except ValueError:
+        return fallback
+    return own
 
 
 def _as_state(value: Any) -> Any:
