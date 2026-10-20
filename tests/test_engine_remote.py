@@ -1,4 +1,7 @@
 import json
+import threading
+from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import httpx2
 import pytest
@@ -143,3 +146,89 @@ def test_status_and_repr_never_show_the_api_key():
     engine = engine_with(lambda request: httpx2.Response(200, json=ANSWER), api_key=SECRET)
     assert engine.status() == {"backend": "remote", "url": URL, "api_key": True}
     assert SECRET not in repr(engine)
+
+
+# Final review: a proxy named in the environment or the system settings, with the user's decision
+# of 2026-10-20 to ignore it for a loopback remote.url and keep it for every other host.
+
+
+@contextmanager
+def recording_server():
+    """A server on 127.0.0.1 that answers every POST with ANSWER.
+
+    Yields its port and the (request line, Authorization) pairs it saw. A proxy sees the full URL
+    in the request line.
+    """
+    seen = []
+    reply = json.dumps(ANSWER).encode()
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            seen.append((self.requestline, self.headers.get("Authorization")))
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(reply)))
+            self.end_headers()
+            self.wfile.write(reply)
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield server.server_address[1], seen
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def use_proxy(monkeypatch, port):
+    """Name the proxy in every variable httpx2 reads, with no host exempted."""
+    for name in ("NO_PROXY", "no_proxy", "HTTPS_PROXY", "https_proxy"):
+        monkeypatch.delenv(name, raising=False)
+    for name in ("HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"):
+        monkeypatch.setenv(name, f"http://127.0.0.1:{port}")
+
+
+@pytest.mark.parametrize("host", ["127.0.0.1", "localhost"])
+def test_a_loopback_backend_is_never_reached_through_a_proxy(monkeypatch, host):
+    # Through the proxy, a local Kev would hand every state and the API key over in clear text.
+    with recording_server() as (port, target), recording_server() as (proxy_port, proxy):
+        use_proxy(monkeypatch, proxy_port)
+        engine = RemoteJevEngine(f"http://{host}:{port}/v1/systemone", api_key=SECRET)
+        assert engine.decide("x", QUESTIONS, "auto").answers == ANSWER["answers"]
+    assert proxy == []
+    assert target == [("POST /v1/systemone HTTP/1.1", f"Bearer {SECRET}")]
+
+
+def test_any_other_backend_still_goes_through_the_configured_proxy(monkeypatch):
+    with recording_server() as (proxy_port, proxy):
+        use_proxy(monkeypatch, proxy_port)
+        engine = RemoteJevEngine("http://kev.example:8009/v1/systemone", api_key=SECRET)
+        assert engine.decide("x", QUESTIONS, "auto").answers == ANSWER["answers"]
+    assert proxy == [("POST http://kev.example:8009/v1/systemone HTTP/1.1", f"Bearer {SECRET}")]
+
+
+@pytest.mark.parametrize(
+    ("host", "loopback"),
+    [
+        ("127.0.0.1", True),
+        ("127.8.9.10", True),
+        ("[::1]", True),
+        ("localhost", True),
+        ("LocalHost", True),
+        ("10.0.0.1", False),
+        ("128.0.0.1", False),
+        ("[::2]", False),
+        ("kev.example", False),
+        ("localhost.example", False),
+    ],
+)
+def test_the_environment_is_ignored_only_for_a_loopback_host(host, loopback):
+    # 127.0.0.0/8, ::1 and localhost; the two tests above send real requests for two of them.
+    engine = RemoteJevEngine(f"http://{host}:8009/v1/systemone")
+    assert engine._client.trust_env is not loopback

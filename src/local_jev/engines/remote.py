@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import math
 from typing import Any
 
@@ -12,6 +13,16 @@ from local_jev.errors import ModelUnavailable
 from local_jev.security import fits_in_a_header
 
 ENDPOINT_HINT = "is remote.url a Jev-compatible /v1/systemone endpoint?"
+
+
+def _is_loopback(host: str) -> bool:
+    """Whether the host is this Mac: localhost, 127.0.0.0/8 or ::1. httpx2 lowercases it."""
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 class RemoteJevEngine:
@@ -28,7 +39,10 @@ class RemoteJevEngine:
     ) -> None:
         self._url = url
         self._api_key = api_key
-        self._client = httpx2.Client(timeout=timeout, transport=transport)
+        # With trust_env, a proxy from the environment or the system settings gets every state
+        # and the API key, in clear text over http. A server on this Mac needs no proxy.
+        trust_env = not _is_loopback(httpx2.URL(url).host)
+        self._client = httpx2.Client(timeout=timeout, transport=transport, trust_env=trust_env)
 
     def decide(self, state: Any, questions: dict[str, dict[str, Any]], model: str) -> EngineResult:
         payload = {

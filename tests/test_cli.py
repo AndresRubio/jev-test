@@ -490,12 +490,13 @@ def test_install_agent_copies_every_setting_the_server_reads(monkeypatch, tmp_pa
         monkeypatch.setenv(name, value)
     monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
     monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path / "hf" / "hub"))
-    # Not settings the server reads, or credentials that must stay out of the plist. JEV_API_KEY is
-    # the variable the config file names as the hosted-Jev key.
+    # With the remote backend the server also reads the API key, from the variable that
+    # remote.api_key_env names (the user's decision of 2026-10-20).
     (tmp_path / "none.toml").write_text('[remote]\napi_key_env = "JEV_API_KEY"\n')
+    monkeypatch.setenv("JEV_API_KEY", "jev_secret")
+    # Not settings the server reads, or credentials that must stay out of the plist.
     monkeypatch.setenv("LOCAL_JEV_SOMETHING_ELSE", "1")
     monkeypatch.setenv("HF_TOKEN", "hf_secret")
-    monkeypatch.setenv("JEV_API_KEY", "jev_secret")
     installed = fake_agent_install(monkeypatch, tmp_path)
     assert cli.main(["install-agent", "--yes"]) == 0
     assert installed["env"] == {
@@ -505,14 +506,61 @@ def test_install_agent_copies_every_setting_the_server_reads(monkeypatch, tmp_pa
         "LOCAL_JEV_RESULTS_DIR": str(tmp_path / "results"),
         "HF_HOME": str(tmp_path / "hf"),
         "HF_HUB_CACHE": str(tmp_path / "hf" / "hub"),
+        "JEV_API_KEY": "jev_secret",
     }
-    out = capsys.readouterr().out
-    shown = plistlib.loads(
-        out[out.index("<?xml") : out.index("</plist>") + len("</plist>")].encode()
-    )
-    assert shown["EnvironmentVariables"] == {**installed["env"], "LOCAL_JEV_TOKEN": "***"}
+    captured = capsys.readouterr()
+    assert shown_environment(captured.out) == {
+        **installed["env"],
+        "LOCAL_JEV_TOKEN": "***",
+        "JEV_API_KEY": "***",
+    }
     for secret in ("s3cret", "hf_secret", "jev_secret"):
-        assert secret not in out
+        assert secret not in captured.out + captured.err
+    assert captured.err == ""
+
+
+def shown_environment(out):
+    """The EnvironmentVariables of the plist that install-agent printed."""
+    plist = out[out.index("<?xml") : out.index("</plist>") + len("</plist>")]
+    return plistlib.loads(plist.encode())["EnvironmentVariables"]
+
+
+REMOTE_WITH_A_KEY = (
+    'backend = "remote"\n\n'
+    '[remote]\nurl = "http://127.0.0.1:8009/v1/systemone"\napi_key_env = "JEV_API_KEY"\n'
+)
+
+
+@pytest.mark.parametrize("value", [None, "", "  \n"], ids=["unset", "empty", "blank"])
+def test_install_agent_warns_when_the_remote_api_key_is_not_set_and_still_installs(
+    monkeypatch, tmp_path, capsys, value
+):
+    # build_engine strips the key and sends none when nothing is left.
+    (tmp_path / "none.toml").write_text(REMOTE_WITH_A_KEY)
+    if value is None:
+        monkeypatch.delenv("JEV_API_KEY", raising=False)
+    else:
+        monkeypatch.setenv("JEV_API_KEY", value)
+    installed = fake_agent_install(monkeypatch, tmp_path)
+    assert cli.main(["install-agent", "--yes"]) == 0
+    assert "JEV_API_KEY" not in installed["env"]
+    captured = capsys.readouterr()
+    assert captured.err == (
+        "warning: JEV_API_KEY is not set, so the login agent will send no API key"
+        " to the remote backend\n"
+    )
+    assert captured.out.endswith(f"(logs in {tmp_path / 'logs'})\n")
+
+
+def test_install_agent_copies_no_api_key_for_the_laya_backend(monkeypatch, tmp_path, capsys):
+    (tmp_path / "none.toml").write_text('[remote]\napi_key_env = "JEV_API_KEY"\n')
+    monkeypatch.setenv("JEV_API_KEY", "jev_secret")
+    installed = fake_agent_install(monkeypatch, tmp_path)
+    assert cli.main(["install-agent", "--yes"]) == 0
+    assert "JEV_API_KEY" not in installed["env"]
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert "jev_secret" not in captured.out
 
 
 def test_install_agent_makes_the_copied_paths_absolute(monkeypatch, tmp_path, capsys):

@@ -209,9 +209,11 @@ def cmd_connect(args: argparse.Namespace, settings: Settings) -> int:
 
 def cmd_install_agent(args: argparse.Namespace, settings: Settings) -> int:
     program = _serve_command()
-    env = _agent_environment()
+    api_key = _remote_api_key(settings)
+    env = {**_agent_environment(), **api_key}
     log_dir = settings.log_dir.resolve()
-    shown = {key: ("***" if key == "LOCAL_JEV_TOKEN" else value) for key, value in env.items()}
+    masked = {"LOCAL_JEV_TOKEN", *api_key}
+    shown = {key: ("***" if key in masked else value) for key, value in env.items()}
     plist = launchd.plist_path()
     print(f"This writes {plist} (mode 600) and loads it with launchctl:\n")
     print(launchd.render_plist(program, log_dir, shown).decode())
@@ -309,6 +311,26 @@ def _agent_environment() -> dict[str, str]:
             value = str(Path(value).resolve())
         env[name] = value
     return env
+
+
+def _remote_api_key(settings: Settings) -> dict[str, str]:
+    """The variable that remote.api_key_env names, for the login agent of a remote backend.
+
+    The server reads the API key from it, and launchd does not read the shell profile. A value
+    that is unset or blank, which build_engine treats as no key, is not copied: a warning says so.
+    """
+    name = settings.remote.api_key_env
+    if settings.backend != "remote" or not name:
+        return {}
+    value = os.environ.get(name, "")
+    if not value.strip():
+        print(
+            f"warning: {name} is not set, so the login agent will send no API key"
+            " to the remote backend",
+            file=sys.stderr,
+        )
+        return {}
+    return {name: value}
 
 
 def _read_state(path: Path) -> Any:
