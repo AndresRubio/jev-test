@@ -11,9 +11,11 @@ import uvicorn
 from mcp import Client
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from mcp.server.transport_security import TransportSecurityMiddleware
+from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.testclient import TestClient
 
+from local_jev.api_rest import MAX_BODY_BYTES, build_rest_routes
 from local_jev.app import build_engine, create_app, mcp_transport_security
 from local_jev.config import RemoteSettings
 from local_jev.engines.remote import RemoteJevEngine
@@ -26,8 +28,8 @@ DEPT = {"dept": {"type": "choice", "instructions": "Which team?", "criteria": ["
 JSON = {"content-type": "application/json"}
 
 
-def client_for(settings, *, host=None, **options):
-    service = DecisionService(settings, FakeEngine())
+def client_for(settings, *, host=None, engine=None, **options):
+    service = DecisionService(settings, engine or FakeEngine())
     base = f"http://{host or f'127.0.0.1:{settings.port}'}"
     return TestClient(create_app(settings, service=service), base_url=base, **options)
 
@@ -163,6 +165,52 @@ def test_a_body_that_is_not_an_object_is_422(settings, path, body):
     assert response.json()["error"]["code"] == "invalid_request"
 
 
+NON_FINITE = ["NaN", "Infinity", "-Infinity", "1e400", "-1e400"]
+
+
+@pytest.mark.parametrize("literal", NON_FINITE)
+def test_a_non_finite_number_in_a_decide_body_is_422(settings, literal):
+    # json.loads reads NaN and the infinities, and turns a literal that overflows, 1e400, into inf.
+    engine = FakeEngine()
+    body = f'{{"state": {{"n": {literal}}}, "questions": {json.dumps(DEPT)}}}'.encode()
+    with client_for(settings, engine=engine, raise_server_exceptions=False) as client:
+        response = client.post("/v1/systemone", content=body, headers=JSON)
+    assert response.status_code == 422
+    error = response.json()["error"]
+    assert error["code"] == "invalid_request"
+    assert error["message"].startswith("the body is not valid JSON: ")
+    assert literal in error["message"]
+    assert error["hint"] == "send a JSON object"
+    assert engine.calls == []
+
+
+@pytest.mark.parametrize("literal", NON_FINITE)
+def test_a_non_finite_number_as_a_batch_item_id_is_422(settings, literal):
+    # The batch would run and echo the id in matches, and the response could not be written.
+    engine = FakeEngine()
+    items = f'[{{"id": {literal}, "text": "tech"}}]'
+    body = f'{{"questions": {json.dumps(DEPT)}, "items": {items}}}'.encode()
+    with client_for(settings, engine=engine, raise_server_exceptions=False) as client:
+        response = client.post("/v1/batch", content=body, headers=JSON)
+    assert response.status_code == 422
+    error = response.json()["error"]
+    assert error["code"] == "invalid_request"
+    assert error["message"].startswith("the body is not valid JSON: ")
+    assert literal in error["message"]
+    assert error["hint"] == "send a JSON object"
+    assert engine.calls == []
+
+
+def test_a_long_out_of_range_number_is_not_echoed_in_full(settings):
+    body = (
+        b'{"state": {"n": 1' + b"0" * 400 + b'.5}, "questions": ' + json.dumps(DEPT).encode() + b"}"
+    )
+    with client_for(settings, raise_server_exceptions=False) as client:
+        response = client.post("/v1/systemone", content=body, headers=JSON)
+    assert response.status_code == 422
+    assert len(response.json()["error"]["message"]) < 200
+
+
 def test_an_oversized_body_without_a_content_length_is_413(settings):
     def chunks():
         for _ in range(6):
@@ -173,6 +221,62 @@ def test_an_oversized_body_without_a_content_length_is_413(settings):
     assert "content-length" not in response.request.headers  # sent as Transfer-Encoding: chunked
     assert response.status_code == 413
     assert response.json()["error"]["code"] == "too_large"
+
+
+def padded(request, size):
+    """The request as JSON, then spaces, in exactly `size` bytes."""
+    raw = json.dumps(request).encode()
+    return raw + b" " * (size - len(raw))
+
+
+def in_chunks(body, size=1024 * 1024):
+    for start in range(0, len(body), size):
+        yield body[start : start + size]
+
+
+@pytest.mark.parametrize("chunked", [False, True])
+@pytest.mark.parametrize(("extra", "status"), [(0, 200), (1, 413)])
+def test_rest_serves_a_body_of_exactly_the_limit_and_refuses_one_byte_more(
+    settings, chunked, extra, status
+):
+    body = padded(JEV_DOC_EXAMPLE, MAX_BODY_BYTES + extra)
+    with client_for(settings, raise_server_exceptions=False) as client:
+        response = client.post(
+            "/v1/systemone", content=in_chunks(body) if chunked else body, headers=JSON
+        )
+    assert ("content-length" in response.request.headers) is not chunked
+    assert response.status_code == status
+
+
+@pytest.mark.anyio
+async def test_a_chunked_body_over_the_limit_is_refused_before_it_is_read_in_full(settings):
+    service = DecisionService(settings, FakeEngine())
+    app = Starlette(routes=build_rest_routes(service))
+    pulled = 0
+
+    async def megabytes():
+        nonlocal pulled
+        while True:
+            pulled += 1
+            assert pulled <= 10, "the whole body was read"
+            yield b"x" * (1024 * 1024)
+
+    transport = httpx2.ASGITransport(app=app)
+    client = httpx2.AsyncClient(transport=transport, base_url="http://127.0.0.1:7711")
+    try:
+        response = await client.post("/v1/systemone", content=megabytes(), headers=JSON)
+    finally:
+        await client.aclose()
+        await service.stop()
+    assert response.status_code == 413
+    error = response.json()["error"]
+    assert error["code"] == "too_large"
+    assert (
+        error["message"]
+        == f"the body is over {MAX_BODY_BYTES} bytes; the limit is {MAX_BODY_BYTES}"
+    )
+    assert error["hint"] == "use decide_batch with a path"
+    assert pulled == 6  # the sixth megabyte is the first to pass 5 MiB
 
 
 def test_a_lone_surrogate_in_an_error_message_still_gives_a_json_error(settings, tmp_path):
@@ -304,20 +408,31 @@ def test_the_lifespan_starts_the_service_then_mcp_and_stops_them_in_reverse(sett
     assert events == ["service started", "mcp running", "mcp stopped", "service stopped"]
 
 
+MCP_INITIALIZE = {
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "initialize",
+    "params": {
+        "protocolVersion": "2025-06-18",
+        "capabilities": {},
+        "clientInfo": {"name": "test", "version": "0"},
+    },
+}
+
+
 def mcp_initialize(base, **headers):
     """POST an MCP initialize request to /mcp, as a client would, with extra headers."""
-    request = {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "initialize",
-        "params": {
-            "protocolVersion": "2025-06-18",
-            "capabilities": {},
-            "clientInfo": {"name": "test", "version": "0"},
-        },
-    }
     headers = {"accept": "application/json, text/event-stream", **headers}
-    return httpx2.post(f"{base}/mcp", json=request, headers=headers, timeout=10)
+    return httpx2.post(f"{base}/mcp", json=MCP_INITIALIZE, headers=headers, timeout=10)
+
+
+@pytest.mark.parametrize(("extra", "status"), [(0, 200), (1, 413)])
+def test_mcp_has_the_same_body_limit_as_rest(settings, extra, status):
+    body = padded(MCP_INITIALIZE, MAX_BODY_BYTES + extra)
+    headers = {**JSON, "accept": "application/json, text/event-stream"}
+    with client_for(settings, raise_server_exceptions=False) as client:
+        response = client.post("/mcp", content=body, headers=headers)
+    assert response.status_code == status
 
 
 def test_mcp_over_http_applies_the_loopback_origin_rule(settings):

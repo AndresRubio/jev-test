@@ -12,7 +12,7 @@ from starlette.middleware import Middleware
 from starlette.routing import Mount
 
 from local_jev.api_mcp import build_mcp_server
-from local_jev.api_rest import build_rest_routes
+from local_jev.api_rest import MAX_BODY_BYTES, build_rest_routes
 from local_jev.config import Settings
 from local_jev.engines.base import Engine
 from local_jev.security import SecurityMiddleware, loopback_hosts
@@ -60,6 +60,7 @@ def create_app(settings: Settings, *, service: DecisionService | None = None) ->
     mcp_app = mcp.streamable_http_app(
         streamable_http_path="/mcp",
         host="127.0.0.1",
+        max_request_body_size=MAX_BODY_BYTES,
         transport_security=mcp_transport_security(settings.port),
     )
 
