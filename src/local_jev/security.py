@@ -22,6 +22,16 @@ LOOPBACK_ORIGIN = re.compile(
 )
 
 
+def fits_in_a_header(value: str) -> bool:
+    """Whether the HTTP stack can carry the value, a token or an API key, in a header.
+
+    The stack quotes a header value it refuses (trailing whitespace, control characters) in its
+    error text, and non-ASCII text raises a bare UnicodeEncodeError. A secret that fails this
+    check is never sent, so it cannot reach an exception message or a log.
+    """
+    return value.isascii() and value.isprintable() and value == value.strip()
+
+
 def loopback_hosts(port: int) -> frozenset[str]:
     return frozenset({f"127.0.0.1:{port}", f"localhost:{port}", f"[::1]:{port}"})
 

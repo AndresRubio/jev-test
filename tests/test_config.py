@@ -120,3 +120,144 @@ def test_path_env_vars_are_the_ones_that_hold_a_path():
         "LOCAL_JEV_RESULTS_DIR",
     }
     assert set(config_module.PATH_ENV_VARS) <= set(config_module.ENV_VARS)
+
+
+# Final review: relative paths, the token and remote.url are checked when the settings load.
+
+
+@pytest.mark.parametrize(
+    ("text", "key"),
+    [
+        ('[batch]\nallowed_roots = ["."]\n', "batch.allowed_roots"),
+        ('[batch]\nallowed_roots = ["~/data", "data"]\n', "batch.allowed_roots"),
+        ('log_dir = "logs"\n', "log_dir"),
+        ('results_dir = "./results"\n', "results_dir"),
+    ],
+)
+def test_a_relative_path_in_the_file_is_refused(tmp_path, monkeypatch, text, key):
+    # The login agent starts in /, where "." would open the whole disk to decide_batch.
+    monkeypatch.chdir(tmp_path)
+    config = tmp_path / "config.toml"
+    config.write_text(text)
+    with pytest.raises(ConfigError) as info:
+        load_settings(config, env={})
+    assert str(info.value) == f"{key} must be an absolute path (a leading ~ is allowed)"
+
+
+def test_absolute_paths_and_paths_from_the_home_folder_are_accepted(tmp_path):
+    config = tmp_path / "config.toml"
+    config.write_text(
+        f'log_dir = "~/logs"\nresults_dir = "{tmp_path / "results"}"\n\n'
+        f'[batch]\nallowed_roots = ["~", "{tmp_path}"]\n'
+    )
+    settings = load_settings(config, env={})
+    assert settings.log_dir == Path.home() / "logs"
+    assert settings.results_dir == tmp_path / "results"
+    assert settings.batch.allowed_roots == (Path.home(), tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("var", "name"), [("LOCAL_JEV_LOG_DIR", "log_dir"), ("LOCAL_JEV_RESULTS_DIR", "results_dir")]
+)
+def test_a_relative_path_in_the_environment_is_taken_from_the_current_folder(
+    tmp_path, monkeypatch, var, name
+):
+    monkeypatch.chdir(tmp_path)
+    settings = load_settings(tmp_path / "missing.toml", env={var: "state/here"})
+    assert getattr(settings, name) == tmp_path / "state" / "here"
+
+
+def test_the_token_stays_out_of_the_settings_repr(tmp_path):
+    settings = load_settings(tmp_path / "missing.toml", env={"LOCAL_JEV_TOKEN": "probe-token-8"})
+    assert settings.token == "probe-token-8"
+    assert "probe-token-8" not in repr(settings)
+    assert "probe-token-8" not in str(settings)
+
+
+@pytest.mark.parametrize(
+    "token",
+    [
+        "probe-token-9 ",
+        " probe-token-9",
+        "probe-token-9\n",
+        "probe\ttoken-9",
+        "probe-tökén-9",
+        "probe-token-9\x7f",
+        b"probe-token-9\xff".decode("utf-8", "surrogateescape"),
+    ],
+    ids=["trailing-space", "leading-space", "newline", "tab", "non-ascii", "delete", "bad-utf8"],
+)
+def test_a_token_no_request_can_carry_is_refused_without_showing_it(tmp_path, token):
+    # Every request would get a 401, because the HTTP stack cannot send it as a header value.
+    with pytest.raises(ConfigError) as info:
+        load_settings(tmp_path / "missing.toml", env={"LOCAL_JEV_TOKEN": token})
+    message = str(info.value)
+    assert message == ("LOCAL_JEV_TOKEN must be printable ASCII with no whitespace at either end")
+    assert "probe" not in message
+
+
+REMOTE = {"LOCAL_JEV_BACKEND": "remote"}
+
+
+NOT_A_URL = (
+    "remote.url (or LOCAL_JEV_REMOTE_URL) must be an http or https URL with a host, "
+    "such as http://127.0.0.1:8009/v1/systemone"
+)
+USERINFO = (
+    "remote.url (or LOCAL_JEV_REMOTE_URL) must not hold a user name or password; "
+    "put the API key in the variable that remote.api_key_env names"
+)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "ftp://127.0.0.1:8009/v1/systemone",
+        "127.0.0.1:8009/v1/systemone",
+        "/v1/systemone",
+        " http://127.0.0.1:8009/v1/systemone",
+        "http:///v1/systemone",
+        "http://127.0.0.1:port/v1/systemone",
+        "http://[::1/v1/systemone",
+        "http://127.0.0.1\n:8009/v1/systemone",
+    ],
+)
+def test_a_remote_url_the_engine_cannot_post_to_is_refused(tmp_path, url):
+    with pytest.raises(ConfigError) as info:
+        load_settings(tmp_path / "missing.toml", env={**REMOTE, "LOCAL_JEV_REMOTE_URL": url})
+    assert str(info.value) == NOT_A_URL
+    assert info.value.__context__ is None
+
+
+@pytest.mark.parametrize(
+    ("url", "message"),
+    [
+        ("http://kev:pa55word@127.0.0.1:8009/v1/systemone", USERINFO),
+        ("https://pa55word@jev.example/v1/systemone", USERINFO),
+        ("http://kev:pa55word@127.0.0.1:port/v1/systemone", NOT_A_URL),
+    ],
+)
+def test_a_remote_url_with_a_user_name_or_password_is_refused_without_showing_it(
+    tmp_path, url, message
+):
+    # httpx2 sends the userinfo as Basic auth, and status() would show it.
+    config = tmp_path / "config.toml"
+    config.write_text(f'backend = "remote"\n\n[remote]\nurl = "{url}"\n')
+    with pytest.raises(ConfigError) as info:
+        load_settings(config, env={})
+    assert str(info.value) == message
+    assert info.value.__context__ is None
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://127.0.0.1:8009/v1/systemone",
+        "http://localhost:8009/v1/systemone",
+        "http://[::1]:8009/v1/systemone",
+        "HTTPS://jev.example/v1/systemone",
+    ],
+)
+def test_a_usable_remote_url_is_accepted(tmp_path, url):
+    settings = load_settings(tmp_path / "missing.toml", env={**REMOTE, "LOCAL_JEV_REMOTE_URL": url})
+    assert settings.remote.url == url

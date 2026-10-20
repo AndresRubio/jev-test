@@ -21,7 +21,7 @@ from starlette.testclient import TestClient
 
 from local_jev import app as app_module
 from local_jev import checkpoints, cli, launchd
-from local_jev.config import LayaSettings
+from local_jev.config import LayaSettings, Settings
 from local_jev.engines import laya_mlx
 from local_jev.engines.laya_mlx import LayaMLXEngine
 from local_jev.errors import ChecksumMismatch, ModelUnavailable
@@ -930,29 +930,43 @@ def test_loopback_requests_never_go_through_a_proxy(monkeypatch, real_http):
     assert target == [("GET /v1/status HTTP/1.1", "Bearer probe-token-1")]
 
 
-@pytest.mark.parametrize(
+UNSENDABLE_TOKENS = pytest.mark.parametrize(
     "token",
-    ["probe-token-2 ", "probe\ntoken-4", "probe\rtoken-5"],
-    ids=["trailing-space", "newline", "carriage-return"],
+    ["probe-token-2 ", "probe\ntoken-4", "probe\rtoken-5", "probe-tökén-6"],
+    ids=["trailing-space", "newline", "carriage-return", "non-ascii"],
 )
-def test_a_token_that_is_not_a_header_value_is_never_printed(monkeypatch, capsys, real_http, token):
-    # httpx2 refuses the header with a message that repeats the whole value, token included.
+
+
+@UNSENDABLE_TOKENS
+def test_a_token_that_is_not_a_header_value_stops_every_command_unseen(
+    monkeypatch, capsys, real_http, token
+):
+    # The server would answer every request with a 401, so the settings refuse the token.
     with loopback_server() as (port, seen):
         monkeypatch.setenv("LOCAL_JEV_PORT", str(port))
         monkeypatch.setenv("LOCAL_JEV_TOKEN", token)
-        assert cli.main(["status"]) == 1
+        assert cli.main(["status"]) == 2
     captured = capsys.readouterr()
     assert captured.out == ""
-    assert captured.err == BAD_TOKEN_MESSAGE
+    assert captured.err == (
+        "config error: LOCAL_JEV_TOKEN must be printable ASCII with no whitespace at either end\n"
+    )
     assert seen == []
 
 
-def test_a_token_that_is_not_ascii_is_never_printed_or_sent(monkeypatch, capsys, real_http):
-    # httpx2 cannot encode it as a header, and its error names the character it failed on.
-    monkeypatch.setenv("LOCAL_JEV_TOKEN", "probe-tökén-6")
-    assert cli.main(["status"]) == 1
+@UNSENDABLE_TOKENS
+def test_the_request_seam_never_prints_or_sends_a_token_that_is_not_a_header_value(
+    capsys, real_http, token
+):
+    # httpx2 refuses such a header with a message that repeats the whole value, token included,
+    # and cannot encode a non-ASCII one. _call keeps its own check for Settings made in code.
+    with loopback_server() as (port, seen):
+        assert (
+            cli._call(Settings(port=port, token=token), "GET", "/v1/status", None, timeout=5) == 1
+        )
     captured = capsys.readouterr()
     assert (captured.out, captured.err) == ("", BAD_TOKEN_MESSAGE)
+    assert seen == []
 
 
 def test_request_wraps_a_reply_that_is_not_json(monkeypatch):

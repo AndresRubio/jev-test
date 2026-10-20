@@ -9,18 +9,9 @@ import httpx2
 
 from local_jev.engines.base import EngineCapabilities, EngineResult
 from local_jev.errors import ModelUnavailable
+from local_jev.security import fits_in_a_header
 
 ENDPOINT_HINT = "is remote.url a Jev-compatible /v1/systemone endpoint?"
-
-
-def _fits_in_a_header(key: str) -> bool:
-    """Whether the HTTP stack can carry the key as a header value.
-
-    The stack quotes a header value it refuses (trailing whitespace, control characters) in its
-    error text, and non-ASCII text raises a bare UnicodeEncodeError. A key that fails this check
-    is never sent, so it cannot reach an exception message or a log.
-    """
-    return key.isascii() and key.isprintable() and key == key.strip()
 
 
 class RemoteJevEngine:
@@ -45,7 +36,7 @@ class RemoteJevEngine:
             "state": state,
             "questions": questions,
         }
-        if self._api_key and not _fits_in_a_header(self._api_key):
+        if self._api_key and not fits_in_a_header(self._api_key):
             raise ModelUnavailable(
                 "the API key for the remote backend cannot be sent as an HTTP header",
                 "check the key for stray whitespace or non-ASCII characters (remote.api_key_env)",

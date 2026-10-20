@@ -10,11 +10,16 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
+import httpx2
+
+from local_jev.security import fits_in_a_header
+
 DEFAULT_CONFIG_PATH = Path("~/.config/local-jev/config.toml")
 LAYA_REVISION = "c5d78730f3493e4fe16d61507ef4b78eef7318cf"
 CHECKPOINT_NAMES = ("english", "multilingual", "typed-decisions")
 CONFIG_ENV = "LOCAL_JEV_CONFIG"
 REMOTE_URL_ENV = "LOCAL_JEV_REMOTE_URL"
+REMOTE_URL_EXAMPLE = "http://127.0.0.1:8009/v1/systemone"
 
 
 class ConfigError(ValueError):
@@ -52,7 +57,7 @@ class Settings:
     idle_unload_minutes: float = 15.0
     noul_mode: str = "ab_labels"
     log_inputs: bool = False
-    token: str | None = None
+    token: str | None = field(default=None, repr=False)
     request_timeout_seconds: float = 30.0
     queue_limit: int = 64
     log_dir: Path = Path.home() / "Library" / "Logs" / "local-jev"
@@ -133,23 +138,42 @@ def _from_mapping(data: dict[str, Any], source: Path) -> Settings:
             for sub, sub_value in value.items():
                 if sub not in types:
                     raise ConfigError(f"{source}: unknown setting {key}.{sub}")
-                kwargs[sub] = _coerce(types[sub], sub_value, f"{key}.{sub}")
+                kwargs[sub] = _from_file(types[sub], sub_value, f"{key}.{sub}")
             sections[key] = cls(**kwargs)
         elif key in _TOP:
-            top[key] = _coerce(_TOP[key], value, key)
+            top[key] = _from_file(_TOP[key], value, key)
         else:
             raise ConfigError(f"{source}: unknown setting {key!r}")
     return Settings(**top, **sections)
 
 
+def _from_file(kind: Any, value: Any, where: str) -> Any:
+    """A value from the config file, whose paths must be absolute.
+
+    The login agent starts in /, so a relative path would mean something else there than in a
+    terminal: "." as an allowed root would open the whole disk to decide_batch.
+    """
+    coerced = _coerce(kind, value, where)
+    paths = coerced if kind == "paths" else (coerced,) if kind is Path else ()
+    if not all(path.is_absolute() for path in paths):
+        raise ConfigError(f"{where} must be an absolute path (a leading ~ is allowed)")
+    return coerced
+
+
 def _apply_env(settings: Settings, env: Mapping[str, str]) -> Settings:
     changes = {
-        name: _coerce(kind, env[var], var) for var, (name, kind) in _ENV.items() if env.get(var)
+        name: _from_env(kind, env[var], var) for var, (name, kind) in _ENV.items() if env.get(var)
     }
     settings = replace(settings, **changes)
     if env.get(REMOTE_URL_ENV):
         settings = replace(settings, remote=replace(settings.remote, url=env[REMOTE_URL_ENV]))
     return settings
+
+
+def _from_env(kind: Any, value: str, where: str) -> Any:
+    """A value from the environment, where a relative path means one under the current folder."""
+    coerced = _coerce(kind, value, where)
+    return coerced.resolve() if kind is Path and not coerced.is_absolute() else coerced
 
 
 def _coerce(kind: Any, value: Any, where: str) -> Any:
@@ -205,3 +229,32 @@ def _validate(s: Settings) -> None:
         raise ConfigError(f"laya.prefetch has unknown checkpoints: {unknown}")
     if s.backend == "remote" and not s.remote.url:
         raise ConfigError("backend 'remote' needs remote.url (or LOCAL_JEV_REMOTE_URL)")
+    if s.remote.url:
+        _check_remote_url(s.remote.url)
+    if s.token is not None and not fits_in_a_header(s.token):
+        # Every request would get a 401. The message never repeats the token.
+        raise ConfigError(
+            "LOCAL_JEV_TOKEN must be printable ASCII with no whitespace at either end"
+        )
+
+
+def _check_remote_url(url: str) -> None:
+    """Refuse a URL the remote engine cannot post to, or would send a user name and password to.
+
+    httpx2 raises InvalidURL on every call for a malformed URL, and sends a URL's userinfo as
+    Basic auth. The messages never repeat the URL, because it may hold a password.
+    """
+    where = f"remote.url (or {REMOTE_URL_ENV})"
+    try:
+        parsed: httpx2.URL | None = httpx2.URL(url)
+    except httpx2.InvalidURL:
+        parsed = None  # raised below, outside this block, so the error does not chain the URL
+    if parsed is None or parsed.scheme not in ("http", "https") or not parsed.host:
+        raise ConfigError(
+            f"{where} must be an http or https URL with a host, such as {REMOTE_URL_EXAMPLE}"
+        )
+    if parsed.userinfo:
+        raise ConfigError(
+            f"{where} must not hold a user name or password; "
+            "put the API key in the variable that remote.api_key_env names"
+        )
