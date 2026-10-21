@@ -80,7 +80,7 @@ The README's "What to expect" section has the details.
 
 ## Fixed after the build
 
-On 2026-10-21 the findings that the final review had parked were fixed, each with a test where the fix changes what the code does. All 630 unit tests pass, and the integration tests still give 8 passes and the one expected failure.
+On 2026-10-21 the findings that the final review had parked were fixed, each with a test where the fix changes what the code does. All 648 unit tests pass, and the integration tests still give 8 passes and the one expected failure.
 
 - `serve` starts when its stderr is closed. Python sets `sys.stderr` to None in that case, and the terminal check called `isatty()` on it.
 - An inline MCP item whose id holds NaN or an infinity anywhere, such as `[NaN]`, goes by its number, so the results file stays valid JSON.
@@ -91,7 +91,7 @@ On 2026-10-21 the findings that the final review had parked were fixed, each wit
 - `repr(app.user_middleware)` shows `'***'` where the token was.
 - The upgrade test's expected-failure marker has `raises=AssertionError`.
 - The `decide_batch` description takes its time limit, and the number of long items to split at, from `batch.timeout_seconds`.
-- An https backend on this Mac is checked against `SSL_CERT_FILE` and `SSL_CERT_DIR` again, and proxies stay off for it. Its test builds a certificate with `cryptography`, which is now a declared development dependency.
+- An https backend on this Mac is checked against `SSL_CERT_FILE` and `SSL_CERT_DIR` again, and proxies stay off for it. A file in `SSL_CERT_FILE` that cannot be loaded stops `serve` with a config error that names the file. The login agent does not get these two variables, so under launchd such a backend needs its certificate trusted in the Keychain. The tests build a certificate with `cryptography`, which is now a declared development dependency.
 
 ## Next steps
 
