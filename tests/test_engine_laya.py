@@ -411,6 +411,25 @@ def test_a_round_error_names_only_the_question_its_group_came_from(monkeypatch):
     )
 
 
+# The caller's own ids "0" and "1" look like the ids of a round's groups.
+NUMBERED = {"0": choice(30), "1": NOUL["q"]}
+
+
+def test_a_cut_state_in_the_final_call_stays_with_a_question_called_1(monkeypatch):
+    engine, routers, _ = make_engine(monkeypatch)
+    routers[0].usage_for = laya_usage(truncates=lambda q: 10 if q["type"] == "noul" else 0)
+    result = engine.decide("x", NUMBERED, "auto")
+    assert result.usage["truncated_questions"] == ["1"]
+
+
+def test_a_final_call_error_about_a_question_called_1_keeps_its_message(monkeypatch):
+    engine, routers, _ = make_engine(monkeypatch)
+    routers[0].too_many_options = lambda question: question["type"] == "noul"
+    with pytest.raises(ValueError) as info:
+        engine.decide("x", NUMBERED, "auto")
+    assert str(info.value) == "Question '1' has too many options for the token budget"
+
+
 def test_non_finite_outputs_are_retried_in_float32(monkeypatch):
     engine, routers, _ = make_engine(monkeypatch)
     routers[0].fail_next = FloatingPointError("nan")
