@@ -4,15 +4,33 @@ from __future__ import annotations
 
 import ipaddress
 import math
+import os
 from typing import Any
 
 import httpx2
 
+from local_jev.config import ConfigError
 from local_jev.engines.base import EngineCapabilities, EngineResult
 from local_jev.errors import ModelUnavailable
 from local_jev.security import fits_in_a_header
 
 ENDPOINT_HINT = "is remote.url a Jev-compatible /v1/systemone endpoint?"
+
+
+def _certificate_error(exc: OSError) -> ConfigError | None:
+    """A ConfigError naming the certificate variable that could not be loaded, if one is set.
+
+    The engine is built when the server starts, and the error from ssl names neither the variable
+    nor its file. A path is no secret, so the message shows it.
+    """
+    for name in ("SSL_CERT_FILE", "SSL_CERT_DIR"):
+        value = os.environ.get(name)
+        if value:
+            return ConfigError(
+                f"{name} is {value}, which could not be loaded as certificates "
+                f"({exc.strerror or exc})"
+            )
+    return None
 
 
 def _is_loopback(host: str) -> bool:
@@ -43,16 +61,22 @@ class RemoteJevEngine:
         # With trust_env, a proxy from the environment or the system settings gets every state
         # and the API key, in clear text over http. A server on this Mac needs no proxy.
         trust_env = not _is_loopback(target.host)
-        # trust_env also makes httpx2 read SSL_CERT_FILE and SSL_CERT_DIR, which an https server
-        # on this Mac with its own certificate needs, so its context still reads them.
-        verify = (
-            httpx2.create_ssl_context(trust_env=True)
-            if not trust_env and target.scheme == "https"
-            else True
-        )
-        self._client = httpx2.Client(
-            timeout=timeout, transport=transport, trust_env=trust_env, verify=verify
-        )
+        try:
+            # trust_env also makes httpx2 read SSL_CERT_FILE and SSL_CERT_DIR, which an https
+            # server on this Mac with its own certificate needs, so its context still reads them.
+            verify = (
+                httpx2.create_ssl_context(trust_env=True)
+                if not trust_env and target.scheme == "https"
+                else True
+            )
+            self._client = httpx2.Client(
+                timeout=timeout, transport=transport, trust_env=trust_env, verify=verify
+            )
+        except OSError as exc:  # ssl.SSLError is an OSError too
+            error = _certificate_error(exc)
+            if error is None:
+                raise
+            raise error from exc
 
     def decide(self, state: Any, questions: dict[str, dict[str, Any]], model: str) -> EngineResult:
         payload = {

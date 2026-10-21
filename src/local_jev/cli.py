@@ -110,9 +110,13 @@ def cmd_serve(args: argparse.Namespace, settings: Settings) -> int:
     if args.port:
         settings = replace(settings, port=args.port)
     _configure_logging(settings.log_dir)
-    uvicorn.run(
-        create_app(settings), host="127.0.0.1", port=settings.port, log_config=None, lifespan="on"
-    )
+    try:
+        app = create_app(settings)
+    except ConfigError as exc:
+        # The remote engine loads SSL_CERT_FILE or SSL_CERT_DIR here, after load_settings.
+        print(f"config error: {exc}", file=sys.stderr)
+        return 2
+    uvicorn.run(app, host="127.0.0.1", port=settings.port, log_config=None, lifespan="on")
     return 0
 
 

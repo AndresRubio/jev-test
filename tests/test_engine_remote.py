@@ -13,6 +13,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 
+from local_jev.config import ConfigError
 from local_jev.engines.remote import ENDPOINT_HINT, RemoteJevEngine
 from local_jev.errors import ModelUnavailable
 
@@ -239,9 +240,12 @@ def test_any_other_backend_still_goes_through_the_configured_proxy(monkeypatch):
         ("localhost.example", False),
     ],
 )
-def test_the_environment_is_ignored_only_for_a_loopback_host(host, loopback):
+@pytest.mark.parametrize("scheme", ["http", "https"])
+def test_the_environment_is_ignored_only_for_a_loopback_host(monkeypatch, scheme, host, loopback):
     # 127.0.0.0/8, ::1 and localhost; the two tests above send real requests for two of them.
-    engine = RemoteJevEngine(f"http://{host}:8009/v1/systemone")
+    for name in ("SSL_CERT_FILE", "SSL_CERT_DIR"):
+        monkeypatch.delenv(name, raising=False)
+    engine = RemoteJevEngine(f"{scheme}://{host}:8009/v1/systemone")
     assert engine._client.trust_env is not loopback
 
 
@@ -300,3 +304,33 @@ def test_a_loopback_https_backend_with_an_untrusted_certificate_is_refused(
         with pytest.raises(ModelUnavailable, match="unreachable"):
             engine.decide("x", QUESTIONS, "auto")
     assert seen == []
+
+
+@pytest.mark.parametrize("contents", [None, ""], ids=["missing file", "file with no certificate"])
+@pytest.mark.parametrize(
+    "url",
+    ["https://127.0.0.1:8443/v1/systemone", "http://kev.example:8009/v1/systemone"],
+    ids=["https on this Mac", "another host"],
+)
+def test_a_certificate_file_that_cannot_be_loaded_is_a_config_error(
+    monkeypatch, tmp_path, url, contents
+):
+    # httpx2 loads SSL_CERT_FILE when the engine starts, and its own error names neither the
+    # variable nor the file.
+    path = tmp_path / "certs.pem"
+    if contents is not None:
+        path.write_text(contents)
+    monkeypatch.setenv("SSL_CERT_FILE", str(path))
+    with pytest.raises(ConfigError) as info:
+        RemoteJevEngine(url)
+    assert str(info.value).startswith(f"SSL_CERT_FILE is {path}, which could not be loaded")
+
+
+def test_a_certificate_file_that_cannot_be_loaded_leaves_http_on_this_mac_alone(
+    monkeypatch, tmp_path
+):
+    # Plain http to a loopback host reads no certificates, as before SSL_CERT_FILE was honoured.
+    monkeypatch.setenv("SSL_CERT_FILE", str(tmp_path / "missing.pem"))
+    with recording_server() as (port, _seen):
+        engine = RemoteJevEngine(f"http://127.0.0.1:{port}/v1/systemone")
+        assert engine.decide("x", QUESTIONS, "auto").answers == ANSWER["answers"]

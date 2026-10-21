@@ -397,6 +397,20 @@ def test_serve_sets_up_logging_before_it_builds_the_app(monkeypatch, tmp_path):
     ]
 
 
+def test_serve_reports_a_certificate_file_that_cannot_be_loaded_as_a_config_error(
+    monkeypatch, tmp_path, capsys
+):
+    monkeypatch.setenv("LOCAL_JEV_BACKEND", "remote")
+    monkeypatch.setenv("LOCAL_JEV_REMOTE_URL", "https://127.0.0.1:8443/v1/systemone")
+    monkeypatch.setenv("SSL_CERT_FILE", str(tmp_path / "missing.pem"))
+    monkeypatch.setattr(cli, "_configure_logging", lambda log_dir: None)
+    monkeypatch.setattr(uvicorn, "run", _refuse("uvicorn.run"))
+    assert cli.main(["serve"]) == 2
+    err = capsys.readouterr().err
+    assert err.startswith(f"config error: SSL_CERT_FILE is {tmp_path / 'missing.pem'}, which ")
+    assert "Traceback" not in err
+
+
 def test_serve_port_option_reaches_the_app_and_the_server(monkeypatch):
     # The app's Host allowlist is built from settings.port, so both must see the same port.
     seen = {}
