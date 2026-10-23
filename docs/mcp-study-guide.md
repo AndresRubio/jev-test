@@ -45,8 +45,8 @@ A session has a **lifecycle**:
 
 There are two standard **transports**:
 
-- **stdio**: the client starts the server as a child process and exchanges one JSON message per line on stdin and stdout. Anything else written to stdout corrupts the stream, so logs go to stderr. This is what most editor integrations use for a server they own.
-- **Streamable HTTP**: one URL, here `http://127.0.0.1:7711/mcp`. The client `POST`s each message. The server answers a request with either a plain JSON body or a `text/event-stream` (SSE) that carries notifications and then the response. A `GET` on the same URL opens a stream for messages the server starts. A session id travels in the `Mcp-Session-Id` header. It replaced the older HTTP+SSE transport, which needed two URLs, in version 2025-03-26.
+- stdio: the client starts the server as a child process and exchanges one JSON message per line on stdin and stdout. Anything else written to stdout corrupts the stream, so logs go to stderr. This is what most editor integrations use for a server they own.
+- Streamable HTTP: one URL, here `http://127.0.0.1:7711/mcp`. The client `POST`s each message. The server answers a request with either a plain JSON body or a `text/event-stream` (SSE) that carries notifications and then the response. A `GET` on the same URL opens a stream for messages the server starts. A session id travels in the `Mcp-Session-Id` header. It replaced the older HTTP+SSE transport, which needed two URLs, in version 2025-03-26.
 
 Protocol versions are dates. The SDK in this repo knows `2024-11-05`, `2025-03-26`, `2025-06-18` and `2025-11-25`, which it calls the handshake versions, and `2026-07-28`, where every HTTP request is self-contained: no `initialize`, no session id, and the version and client capabilities travel in each request's `_meta`. local-jev's tests speak `2025-06-18`, the version most agents use today, and the SDK serves either.
 
@@ -67,11 +67,13 @@ Protocol versions are dates. The SDK in this repo knows `2024-11-05`, `2025-03-2
 | HTTP tests with the SDK client | `tests/test_app.py` | `Client(f"{base}/mcp")` against uvicorn, plus the Origin and Host tables |
 | Raw wire tests | `tests/test_mcp_wire.py` | the JSON-RPC messages themselves, through `TestClient` |
 
-Three things to notice about the shape of the code:
+Three things to notice about the shape of the code.
 
-- **MCP is a thin face over the service.** `api_mcp.py` holds no business logic. Each tool builds the same body the REST route receives and hands it to `DecisionService`. Validation, guards, the inference queue, logging and the batch reader are shared. An interviewer who asks "how would you add MCP to an existing service?" is asking for this shape.
-- **The SDK generates the schemas.** `decide(state: str | dict | list, questions: dict[str, dict], model: str = "auto") -> dict` becomes a tool with an `inputSchema` whose `required` is `["state", "questions"]`, a default for `model`, and an `outputSchema` because the return annotation is a dict. The server never writes JSON Schema by hand.
-- **The description is derived from configuration.** `batch_description()` puts the batch time limit and the number of items to split at into the text, so the model reads the limit the server will apply, and `test_decide_batch_states_the_time_limit_the_config_sets` checks that.
+MCP is a thin face over the service. `api_mcp.py` holds no business logic. Each tool builds the same body the REST route receives and hands it to `DecisionService`. Validation, guards, the inference queue, logging and the batch reader are shared. An interviewer who asks "how would you add MCP to an existing service?" is asking for this shape.
+
+The SDK generates the schemas. `decide(state: str | dict | list, questions: dict[str, dict], model: str = "auto") -> dict` becomes a tool with an `inputSchema` whose `required` is `["state", "questions"]`, a default for `model`, and an `outputSchema` because the return annotation is a dict. The server never writes JSON Schema by hand.
+
+The description is derived from configuration. `batch_description()` puts the batch time limit and the number of items to split at into the text, so the model reads the limit the server will apply, and `test_decide_batch_states_the_time_limit_the_config_sets` checks that.
 
 ## 3. The wire, message by message
 
@@ -193,28 +195,46 @@ These HTTP responses carry a JSON-RPC error body with `id: null`, because they a
 
 These are the choices an interviewer can dig into, with the reasoning this repo recorded.
 
-**Why Streamable HTTP and not stdio.** With stdio each client starts its own server process. local-jev holds about 1.5 GB of model weights in memory and takes about 0.8 s to load them, and several agents on the Mac may use it at once, so one long-running process on a port is the right shape. A launchd login agent keeps it up. The cost is that a network listener needs its own security, which stdio gets for free from the process boundary.
+### Why Streamable HTTP and not stdio
 
-**Loopback is not enough.** The server binds to 127.0.0.1, which keeps other machines out but not other programs. Two attacks remain:
+With stdio each client starts its own server process. local-jev holds about 1.5 GB of model weights in memory and takes about 0.8 s to load them, and several agents on the Mac may use it at once, so one long-running process on a port is the right shape. A launchd login agent keeps it up. The cost is that a network listener needs its own security, which stdio gets for free from the process boundary.
+
+### Loopback is not enough
+
+The server binds to 127.0.0.1, which keeps other machines out but not other programs. Two attacks remain:
 
 - *DNS rebinding.* A web page on `evil.example` makes the browser resolve that name to 127.0.0.1 and sends a request the same-origin policy allows. The `Host` header still says `evil.example`, so `SecurityMiddleware` refuses any Host that is not `127.0.0.1`, `localhost` or `[::1]` on the configured port, with a `421`. The MCP spec tells every local HTTP server to do this.
 - *A page on a local origin.* The `Origin` header names the page that sent the request. The middleware allows only loopback origins over plain http and refuses the rest, including `Origin: null`, with a `403`. The SDK has the same check, `TransportSecuritySettings`, and `app.py` configures it with the same allowlist as a second line of defence. The docstring of `mcp_transport_security()` lists where the two checks differ and why the middleware runs first.
 
 Every account on the Mac can also reach 127.0.0.1, so an optional bearer token (`LOCAL_JEV_TOKEN`) guards every path but `/health`. This is a plain header check, not MCP's OAuth 2.1 authorization flow, which is meant for servers on the network.
 
-**Tool descriptions are the prompt.** The model never reads the README. It reads `instructions` once and the three descriptions on every turn. So the rules about how to ask a question (literal reading, no arithmetic, positive phrasing, at most 20 options, probabilities are not calibrated) live in the description, and the batch description quotes the server's own time limit. `tests/test_api_mcp.py` fails if a rule is dropped.
+### Tool descriptions are the prompt
 
-**Keep the data out of the context.** `decide_batch` reads a file of up to 5,000 items on the server side and returns counts, the top matches and the path of a results file. The items never pass through the model's context window. This is the argument for running classification in a tool instead of asking the model to read everything, and the `decide` description tells the model to prefer it for many items.
+The model never reads the README. It reads `instructions` once and the three descriptions on every turn. So the rules about how to ask a question (literal reading, no arithmetic, positive phrasing, at most 20 options, probabilities are not calibrated) live in the description, and the batch description quotes the server's own time limit. `tests/test_api_mcp.py` fails if a rule is dropped.
 
-**Structured output and the text copy.** A dict return type gives each tool an `outputSchema`, and the SDK fills `structuredContent`. The text block holds the same JSON so older clients still work. The REST responses and the MCP results are the same dictionaries, produced once in `DecisionService`.
+### Keep the data out of the context
 
-**Errors that the model can act on.** A `ServiceError` has an HTTP status for REST and a code, message and hint for everyone. Over MCP it becomes `isError: true` with the hint in the text. One subtlety in `_call`: a message can repeat a path the caller sent as the JSON escape `\ud800`, a lone surrogate that is not valid UTF-8, so the text is re-encoded with `backslashreplace` before it goes on the wire.
+`decide_batch` reads a file of up to 5,000 items on the server side and returns counts, the top matches and the path of a results file. The items never pass through the model's context window. This is the argument for running classification in a tool instead of asking the model to read everything, and the `decide` description tells the model to prefer it for many items.
 
-**Lifespan order.** The Starlette lifespan starts the service (inference worker, prefetch, log files), then runs the SDK's session manager, and stops them in reverse. `test_the_lifespan_starts_the_service_then_mcp_and_stops_them_in_reverse` pins the order. The session manager must run inside the app's lifespan or every request fails with "session manager not started".
+### Structured output and the text copy
 
-**One body limit.** `MAX_BODY_BYTES` is passed to `streamable_http_app`, so a 5 MB JSON-RPC message is refused with a `413` exactly like a REST body. Without it the SDK's default of 4 MB would apply to MCP only.
+A dict return type gives each tool an `outputSchema`, and the SDK fills `structuredContent`. The text block holds the same JSON so older clients still work. The REST responses and the MCP results are the same dictionaries, produced once in `DecisionService`.
 
-**What local-jev leaves out, and why.** No resources (there is no data to browse; a results file path in the batch answer does the job), no prompts (the tool descriptions carry the guidance), no sampling or elicitation (the server never needs the model or the user), no progress notifications (calls take tens of milliseconds, batches have their own timeout), no event store for resumable streams, no stateless mode, and no OAuth. Each would be a few lines with this SDK; the example in section 5 shows the server-side primitives.
+### Errors that the model can act on
+
+A `ServiceError` has an HTTP status for REST and a code, message and hint for everyone. Over MCP it becomes `isError: true` with the hint in the text. One subtlety in `_call`: a message can repeat a path the caller sent as the JSON escape `\ud800`, a lone surrogate that is not valid UTF-8, so the text is re-encoded with `backslashreplace` before it goes on the wire.
+
+### Lifespan order
+
+The Starlette lifespan starts the service (inference worker, prefetch, log files), then runs the SDK's session manager, and stops them in reverse. `test_the_lifespan_starts_the_service_then_mcp_and_stops_them_in_reverse` pins the order. The session manager must run inside the app's lifespan or every request fails with "session manager not started".
+
+### One body limit
+
+`MAX_BODY_BYTES` is passed to `streamable_http_app`, so a 5 MB JSON-RPC message is refused with a `413` exactly like a REST body. Without it the SDK's default of 4 MB would apply to MCP only.
+
+### What local-jev leaves out, and why
+
+No resources (there is no data to browse; a results file path in the batch answer does the job), no prompts (the tool descriptions carry the guidance), no sampling or elicitation (the server never needs the model or the user), no progress notifications (calls take tens of milliseconds, batches have their own timeout), no event store for resumable streams, no stateless mode, and no OAuth. Each would be a few lines with this SDK; the example in section 5 shows the server-side primitives.
 
 ## 5. The minimal example: every server primitive on stdio
 
@@ -233,45 +253,85 @@ claude mcp add --transport stdio study-server -- uv run python examples/minimal_
 
 ## 6. Interview questions, with the answers this repo gives
 
-**What problem does MCP solve?** Every host used to need its own integration for every tool. MCP is one protocol between hosts and servers, so a server written once works in Claude Code, Cursor and Codex, and a host supports every server at once. local-jev's `connect` command prints three configurations for the same URL.
+### What problem does MCP solve?
 
-**What is the difference between a tool, a resource and a prompt?** Who controls it. The model calls tools. The application fetches resources, by URI, to put data in front of the user or the model. The user picks prompts. local-jev needs only tools; the example shows all three.
+Every host used to need its own integration for every tool. MCP is one protocol between hosts and servers, so a server written once works in Claude Code, Cursor and Codex, and a host supports every server at once. local-jev's `connect` command prints three configurations for the same URL.
 
-**How does a client learn what a server can do?** `initialize` returns the capabilities, then `tools/list`, `resources/list`, `resources/templates/list` and `prompts/list` return the items. The `listChanged` flags say whether the server will announce changes, so the client knows whether it may cache.
+### What is the difference between a tool, a resource and a prompt?
 
-**Where does the schema for tool arguments come from?** The server sends a JSON Schema in `inputSchema`. The Python SDK builds it from type annotations through pydantic. `decide`'s `required: ["state", "questions"]` and the `"default": "auto"` on `model` come straight from the signature.
+Who controls it. The model calls tools. The application fetches resources, by URI, to put data in front of the user or the model. The user picks prompts. local-jev needs only tools; the example shows all three.
 
-**How does a server tell the model how to use a tool well?** In the tool description and the server `instructions`. Nothing else reaches the model. local-jev puts the rules of the model's behaviour there and tests their presence.
+### How does a client learn what a server can do?
 
-**What is the difference between a tool error and a protocol error?** A tool error is a result with `isError: true` and text the model reads and can act on. A protocol error is a JSON-RPC `error` for the host: malformed message, unknown method, missing session. Validation failures in local-jev are tool errors with a hint, so the model retries with a fixed call.
+`initialize` returns the capabilities, then `tools/list`, `resources/list`, `resources/templates/list` and `prompts/list` return the items. The `listChanged` flags say whether the server will announce changes, so the client knows whether it may cache.
 
-**What is `structuredContent`?** Since version 2025-06-18 a tool can declare an `outputSchema` and return `structuredContent` that matches it, next to the `content` blocks. Clients can validate it and read fields without parsing text.
+### Where does the schema for tool arguments come from?
 
-**Compare stdio and Streamable HTTP.** stdio: the client owns the process, one server per client, no network, no auth needed, logs must avoid stdout. Streamable HTTP: one URL, many clients, sessions by header, server-initiated messages over SSE, needs Host and Origin checks and authentication. local-jev chose HTTP because the model weights are expensive to hold and the server should run at login.
+The server sends a JSON Schema in `inputSchema`. The Python SDK builds it from type annotations through pydantic. `decide`'s `required: ["state", "questions"]` and the `"default": "auto"` on `model` come straight from the signature.
 
-**What does `Mcp-Session-Id` do?** The server mints it on `initialize` and the client sends it on every later request. The server keeps one transport per session. A missing id is `400`, an unknown one `404`, and `DELETE` ends the session.
+### How does a server tell the model how to use a tool well?
 
-**Why does the server answer with `text/event-stream` instead of JSON?** Because while a request runs the server may send notifications (progress, logs) that belong to that request, and SSE lets it put them in front of the response on the same connection. The response is the last event. A server that never streams can set `json_response=True`.
+In the tool description and the server `instructions`. Nothing else reaches the model. local-jev puts the rules of the model's behaviour there and tests their presence.
 
-**What is DNS rebinding and why does a local MCP server care?** A hostile page's domain is pointed at 127.0.0.1 so the browser treats a request to the local server as same-origin. The server sees a `Host` header that is not its own and must refuse it. local-jev refuses with `421` in its middleware and again in the SDK's transport security.
+### What is the difference between a tool error and a protocol error?
 
-**How would you authenticate a Streamable HTTP server?** On a network, with the OAuth 2.1 flow the spec defines, where the server is a resource server and the host obtains a token. On loopback, local-jev uses a static bearer token in the `Authorization` header, set through the host's header configuration (`claude mcp add --header ...`), which keeps other accounts on the same machine out.
+A tool error is a result with `isError: true` and text the model reads and can act on. A protocol error is a JSON-RPC `error` for the host: malformed message, unknown method, missing session. Validation failures in local-jev are tool errors with a hint, so the model retries with a fixed call.
 
-**How do you keep a large dataset out of the model's context?** Do the work in the tool and return a summary. `decide_batch` returns counts, the top matches and a results file path for up to 5,000 items.
+### What is `structuredContent`?
 
-**How do you test an MCP server?** Three levels, all in this repo: the SDK's in-memory client against the server object (`tests/test_api_mcp.py`), the SDK's HTTP client against a real uvicorn (`tests/test_app.py`), and raw JSON-RPC over the transport to check protocol rules (`tests/test_mcp_wire.py`). A fake engine stands in for the model, so none of them needs weights.
+Since version 2025-06-18 a tool can declare an `outputSchema` and return `structuredContent` that matches it, next to the `content` blocks. Clients can validate it and read fields without parsing text.
 
-**What is version negotiation?** The client proposes a version in `initialize`; the server answers with that version if it supports it, or with one it does support, and the client disconnects if it cannot speak that one. On HTTP the client then repeats the version in the `MCP-Protocol-Version` header. Versions are dates; the ones in this repo are listed in section 1.
+### Compare stdio and Streamable HTTP
 
-**What is sampling?** A server asks the client to run its model on messages the server composes. It lets a server use the model without holding an API key. local-jev does not use it.
+stdio: the client owns the process, one server per client, no network, no auth needed, logs must avoid stdout. Streamable HTTP: one URL, many clients, sessions by header, server-initiated messages over SSE, needs Host and Origin checks and authentication. local-jev chose HTTP because the model weights are expensive to hold and the server should run at login.
 
-**What is elicitation?** A server asks the user a question in the middle of a request, through the client, for example to confirm an action or fill in a missing value. Added in 2025-06-18.
+### What does `Mcp-Session-Id` do?
 
-**What happens on a notification?** Nothing is sent back. Over HTTP the server returns `202 Accepted` with an empty body.
+The server mints it on `initialize` and the client sends it on every later request. The server keeps one transport per session. A missing id is `400`, an unknown one `404`, and `DELETE` ends the session.
 
-**How would you add MCP to an existing service?** Build the service so that it takes plain bodies and returns plain dicts, then write a thin adapter per interface. local-jev's `api_mcp.py` and `api_rest.py` are each about 100 lines over a shared `DecisionService`.
+### Why does the server answer with `text/event-stream` instead of JSON?
 
-**What would you change in local-jev's MCP server?** Options recorded in this repo: generate a bearer token by default, add a resource that exposes the results file instead of a path, and send progress notifications during long batches. Each is a small change with this SDK.
+Because while a request runs the server may send notifications (progress, logs) that belong to that request, and SSE lets it put them in front of the response on the same connection. The response is the last event. A server that never streams can set `json_response=True`.
+
+### What is DNS rebinding and why does a local MCP server care?
+
+A hostile page's domain is pointed at 127.0.0.1 so the browser treats a request to the local server as same-origin. The server sees a `Host` header that is not its own and must refuse it. local-jev refuses with `421` in its middleware and again in the SDK's transport security.
+
+### How would you authenticate a Streamable HTTP server?
+
+On a network, with the OAuth 2.1 flow the spec defines, where the server is a resource server and the host obtains a token. On loopback, local-jev uses a static bearer token in the `Authorization` header, set through the host's header configuration (`claude mcp add --header ...`), which keeps other accounts on the same machine out.
+
+### How do you keep a large dataset out of the model's context?
+
+Do the work in the tool and return a summary. `decide_batch` returns counts, the top matches and a results file path for up to 5,000 items.
+
+### How do you test an MCP server?
+
+Three levels, all in this repo: the SDK's in-memory client against the server object (`tests/test_api_mcp.py`), the SDK's HTTP client against a real uvicorn (`tests/test_app.py`), and raw JSON-RPC over the transport to check protocol rules (`tests/test_mcp_wire.py`). A fake engine stands in for the model, so none of them needs weights.
+
+### What is version negotiation?
+
+The client proposes a version in `initialize`; the server answers with that version if it supports it, or with one it does support, and the client disconnects if it cannot speak that one. On HTTP the client then repeats the version in the `MCP-Protocol-Version` header. Versions are dates; the ones in this repo are listed in section 1.
+
+### What is sampling?
+
+A server asks the client to run its model on messages the server composes. It lets a server use the model without holding an API key. local-jev does not use it.
+
+### What is elicitation?
+
+A server asks the user a question in the middle of a request, through the client, for example to confirm an action or fill in a missing value. Added in 2025-06-18.
+
+### What happens on a notification?
+
+Nothing is sent back. Over HTTP the server returns `202 Accepted` with an empty body.
+
+### How would you add MCP to an existing service?
+
+Build the service so that it takes plain bodies and returns plain dicts, then write a thin adapter per interface. local-jev's `api_mcp.py` and `api_rest.py` are each about 100 lines over a shared `DecisionService`.
+
+### What would you change in local-jev's MCP server?
+
+Options recorded in this repo: generate a bearer token by default, add a resource that exposes the results file instead of a path, and send progress notifications during long batches. Each is a small change with this SDK.
 
 ## 7. Try it yourself
 
