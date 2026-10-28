@@ -164,6 +164,8 @@ uv run python eval/run_eval.py   # accuracy; writes eval/results.md
 uv run python scripts/bench.py   # speed and memory; writes docs/benchmarks.md
 ```
 
+[GitHub Actions](.github/workflows/ci.yml) runs `ruff check`, `ruff format --check` and the unit tests on every push to `main` and every pull request. It uses a macOS runner because mlx ships wheels for Apple Silicon only.
+
 The evaluation and the benchmark each start a throwaway server on a free port. It ignores your config file, and its logs and results go to a temporary folder.
 
 Design: [docs/superpowers/specs/2026-09-25-local-jev-design.md](docs/superpowers/specs/2026-09-25-local-jev-design.md).

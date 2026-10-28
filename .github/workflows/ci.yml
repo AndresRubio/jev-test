@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    # mlx ships wheels for Apple Silicon only, so the dependencies resolve on a macOS arm64 runner and nowhere else.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          enable-cache: true
+      - name: Install the project and the dev group from the lock file
+        run: uv sync --locked
+      - name: Lint
+        run: uv run ruff check src tests scripts eval examples
+      - name: Format
+        run: uv run ruff format --check src tests scripts eval examples
+      - name: Unit tests
+        run: uv run pytest
