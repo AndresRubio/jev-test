@@ -1,5 +1,7 @@
-"""examples/minimal_mcp_server.py through the SDK's in-memory client: tools, resources, prompts."""
+"""The two examples: the stdio server through the SDK's in-memory client, and the HTTP client
+against the local-jev app with a fake engine."""
 
+import dataclasses
 import importlib.util
 import sys
 from pathlib import Path
@@ -8,17 +10,31 @@ import pytest
 from mcp import Client
 from mcp.shared.exceptions import MCPError
 
-EXAMPLE = Path(__file__).resolve().parents[1] / "examples" / "minimal_mcp_server.py"
+from local_jev.app import create_app
+from local_jev.service import DecisionService
+from tests.fakes import FakeEngine
+from tests.test_app import free_port, serving
+
+EXAMPLES = Path(__file__).resolve().parents[1] / "examples"
 
 
-@pytest.fixture(scope="module")
-def example():
-    spec = importlib.util.spec_from_file_location("minimal_mcp_server", EXAMPLE)
+def load(name):
+    spec = importlib.util.spec_from_file_location(name, EXAMPLES / f"{name}.py")
     module = importlib.util.module_from_spec(spec)
     # Registered first, so the SDK can resolve the annotations the decorators read.
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
+
+
+@pytest.fixture(scope="module")
+def example():
+    return load("minimal_mcp_server")
+
+
+@pytest.fixture(scope="module")
+def example_client():
+    return load("minimal_mcp_client")
 
 
 @pytest.mark.anyio
@@ -92,3 +108,42 @@ async def test_the_prompt_lists_its_arguments_and_renders_them(example):
     ]
     assert rendered.messages[0].role == "user"
     assert rendered.messages[0].content.text.startswith("Review this code for correctness.")
+
+
+# The client example, against the real app over HTTP.
+
+
+@pytest.fixture
+def served(settings):
+    """The app with a fake engine on a free port; yields the MCP URL."""
+    settings = dataclasses.replace(settings, port=free_port())
+    app = create_app(settings, service=DecisionService(settings, FakeEngine()))
+    with serving(app, settings.port) as base:
+        yield f"{base}/mcp"
+
+
+@pytest.mark.anyio
+async def test_the_client_lists_the_tools_and_calls_decide(example_client, served, capsys):
+    result = await example_client.run(served, "tech outage: the site is down")
+    assert result["answers"]["team"]["choice"] == "tech"
+    out = capsys.readouterr().out.splitlines()
+    assert out[0] == "protocol 2026-07-28, server local-jev"
+    assert out[1:4] == [
+        "tool decide(state, questions)",
+        "tool decide_batch(questions)",
+        "tool status()",
+    ]
+    assert out[4].startswith("team tech {")
+
+
+@pytest.mark.anyio
+async def test_the_token_goes_out_as_a_bearer_header(example_client, settings):
+    settings = dataclasses.replace(settings, port=free_port(), token="s3cret")
+    app = create_app(settings, service=DecisionService(settings, FakeEngine()))
+    with serving(app, settings.port) as base:
+        # The SDK turns any HTTP error but 404 into a JSON-RPC internal error; the 401 is lost.
+        with pytest.raises(ExceptionGroup) as denied:
+            await example_client.run(f"{base}/mcp", "tech outage")
+        assert denied.group_contains(MCPError, match="Server returned an error response")
+        result = await example_client.run(f"{base}/mcp", "tech outage", token="s3cret")
+    assert result["answers"]["team"]["choice"] == "tech"

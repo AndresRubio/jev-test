@@ -172,7 +172,7 @@ Design: [docs/superpowers/specs/2026-09-25-local-jev-design.md](docs/superpowers
 
 ## Learning MCP from this repo
 
-[docs/mcp-study-guide.md](docs/mcp-study-guide.md) explains the Model Context Protocol through this code: the JSON-RPC messages a client sends to `/mcp`, where each part of the protocol lives in `src/`, the design choices behind the server, and a set of interview questions with answers. [tests/test_mcp_wire.py](tests/test_mcp_wire.py) sends those raw messages through the whole app, and [examples/minimal_mcp_server.py](examples/minimal_mcp_server.py) is a stdio server with a tool, resources and a prompt, the primitives local-jev does not use.
+[docs/mcp-study-guide.md](docs/mcp-study-guide.md) explains the Model Context Protocol through this code: the JSON-RPC messages a client sends to `/mcp`, where each part of the protocol lives in `src/`, the design choices behind the server, and a set of interview questions with answers. [tests/test_mcp_wire.py](tests/test_mcp_wire.py) sends those raw messages through the whole app, [examples/minimal_mcp_server.py](examples/minimal_mcp_server.py) is a stdio server with a tool, resources and a prompt, the primitives local-jev does not use, and [examples/minimal_mcp_client.py](examples/minimal_mcp_client.py) is the client side: it connects to local-jev, lists the tools and calls `decide`.
 
 ## Licence
 

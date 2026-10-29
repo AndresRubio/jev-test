@@ -236,7 +236,7 @@ The Starlette lifespan starts the service (inference worker, prefetch, log files
 
 No resources (there is no data to browse; a results file path in the batch answer does the job), no prompts (the tool descriptions carry the guidance), no sampling or elicitation (the server never needs the model or the user), no progress notifications (calls take tens of milliseconds, batches have their own timeout), no event store for resumable streams, no stateless mode, and no OAuth. Each would be a few lines with this SDK; the example in section 5 shows the server-side primitives.
 
-## 5. The minimal example: every server primitive on stdio
+## 5. The two examples: every server primitive on stdio, and the client side
 
 `examples/minimal_mcp_server.py` is under 90 lines, half of them comments. It registers:
 
@@ -250,6 +250,16 @@ No resources (there is no data to browse; a results file path in the batch answe
 ```bash
 claude mcp add --transport stdio study-server -- uv run python examples/minimal_mcp_server.py
 ```
+
+`examples/minimal_mcp_client.py` is the other side: what a host does before it hands a server to the model. With `local-jev serve` running:
+
+```bash
+uv run python examples/minimal_mcp_client.py "The site is down and nobody can log in"
+```
+
+It does three things in 75 lines. `async with Client(url)` runs the handshake: the SDK's default mode first sends `server/discover`, the single request of `2026-07-28`, and falls back to `initialize` when the server answers with an error, so against local-jev the negotiated version is `2026-07-28`. Every request then carries the headers `MCP-Protocol-Version: 2026-07-28` and `Mcp-Method`, plus a `_meta` envelope with the version and the client capabilities; the answers come back as plain JSON, and there is no session header, unlike the curl exchange in section 7. `tests/test_mcp_wire.py` sends that first request raw, with and without the headers. `list_tools` returns what a host gives the model: a name, a description and the input schema per tool. `call_tool` sends `decide` with one typed question and reads the answer from `structuredContent`; when `isError` is set the text block is the message meant for the model, and the example exits with it.
+
+Two details to know. `Client(url)` builds its own HTTP client with no headers, so a bearer token goes through an `httpx2.AsyncClient` passed to `streamable_http_client`. And the SDK turns any HTTP error except `404` into a JSON-RPC internal error (`-32603`, "Server returned an error response") inside an `ExceptionGroup`, so a `401` from a missing token reaches the caller without its status. `tests/test_examples.py` runs the client against the app with a fake engine, with and without the token.
 
 ## 6. Interview questions, with the answers this repo gives
 
@@ -307,7 +317,7 @@ Do the work in the tool and return a summary. `decide_batch` returns counts, the
 
 ### How do you test an MCP server?
 
-Three levels, all in this repo: the SDK's in-memory client against the server object (`tests/test_api_mcp.py`), the SDK's HTTP client against a real uvicorn (`tests/test_app.py`), and raw JSON-RPC over the transport to check protocol rules (`tests/test_mcp_wire.py`). A fake engine stands in for the model, so none of them needs weights.
+Three levels, all in this repo: the SDK's in-memory client against the server object (`tests/test_api_mcp.py`), the SDK's HTTP client against a real uvicorn (`tests/test_app.py`), and raw JSON-RPC over the transport to check protocol rules (`tests/test_mcp_wire.py`). A fake engine stands in for the model, so none of them needs weights. The client side has its own test: `examples/minimal_mcp_client.py` runs against the served app in `tests/test_examples.py`.
 
 ### What is version negotiation?
 

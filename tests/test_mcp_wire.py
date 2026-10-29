@@ -182,3 +182,28 @@ def test_a_second_initialize_opens_a_second_independent_session(client, session)
     assert second != session["mcp-session-id"]
     # Each session is one client; both reach the same DecisionService behind the server.
     assert client.post("/mcp", json=rpc(2, "ping"), headers=session).status_code == 200
+
+
+def test_a_modern_request_carries_the_version_in_a_header_and_needs_no_session(client):
+    # The SDK's client sends this first: server/discover is the single request of 2026-07-28.
+    # The header routes it, the _meta envelope must repeat the version and carry the client
+    # capabilities, and Mcp-Method must match the body. The server answers in plain JSON, mints
+    # no session, and streams nothing. Without the headers the same body is a 400 (section 3.6).
+    envelope = {
+        "_meta": {
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": {},
+        }
+    }
+    headers = {**HEADERS, "mcp-protocol-version": "2026-07-28", "mcp-method": "server/discover"}
+    response = client.post("/mcp", json=rpc(1, "server/discover", envelope), headers=headers)
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("application/json")
+    assert "mcp-session-id" not in response.headers
+    result = payload(response)["result"]
+    assert result["capabilities"]["tools"] == {"listChanged": True}
+    assert result["instructions"].startswith("local-jev answers typed questions")
+
+    no_headers = client.post("/mcp", json=rpc(1, "server/discover", envelope), headers=HEADERS)
+    assert no_headers.status_code == 400
+    assert "session" in payload(no_headers)["error"]["message"].lower()
