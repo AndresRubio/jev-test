@@ -9,6 +9,7 @@ Read in this order:
 3. `src/local_jev/app.py` (81 lines): how the server is mounted and secured.
 4. `tests/test_mcp_wire.py`: the protocol, one raw message per test.
 5. `examples/minimal_mcp_server.py` and `tests/test_examples.py`: resources, prompts and stdio, which local-jev does not use.
+6. `docs/mcp-sdk-notes.md`: the SDK facts the repo depends on, each with the test that pins it.
 
 ## 1. MCP in one page
 
@@ -259,7 +260,7 @@ uv run python examples/minimal_mcp_client.py "The site is down and nobody can lo
 
 It does three things in 75 lines. `async with Client(url)` runs the handshake: the SDK's default mode first sends `server/discover`, the single request of `2026-07-28`, and falls back to `initialize` when the server answers with an error, so against local-jev the negotiated version is `2026-07-28`. Every request then carries the headers `MCP-Protocol-Version: 2026-07-28` and `Mcp-Method`, plus a `_meta` envelope with the version and the client capabilities; the answers come back as plain JSON, and there is no session header, unlike the curl exchange in section 7. `tests/test_mcp_wire.py` sends that first request raw, with and without the headers. `list_tools` returns what a host gives the model: a name, a description and the input schema per tool. `call_tool` sends `decide` with one typed question and reads the answer from `structuredContent`; when `isError` is set the text block is the message meant for the model, and the example exits with it.
 
-Two details to know. `Client(url)` builds its own HTTP client with no headers, so a bearer token goes through an `httpx2.AsyncClient` passed to `streamable_http_client`. And the SDK turns any HTTP error except `404` into a JSON-RPC internal error (`-32603`, "Server returned an error response") inside an `ExceptionGroup`, so a `401` from a missing token reaches the caller without its status. `tests/test_examples.py` runs the client against the app with a fake engine, with and without the token.
+Two details to know. `Client(url)` builds its own HTTP client with no headers, so a bearer token goes through an `httpx2.AsyncClient` passed to `streamable_http_client`. And when a request gets a non-2xx answer whose body is not a JSON-RPC error, the SDK turns it into a JSON-RPC error of its own (`404` apart, `-32603` "Server returned an error response") inside an `ExceptionGroup`, so the `401` for a missing token reaches the caller without its status. `docs/mcp-sdk-notes.md` has the full mapping. `tests/test_examples.py` runs the client against the app with a fake engine, with and without the token.
 
 ## 6. Interview questions, with the answers this repo gives
 
