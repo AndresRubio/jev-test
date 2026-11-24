@@ -33,6 +33,11 @@ def test_ece_weights_each_bucket_gap_by_its_share_of_the_records():
     assert ece(records) == pytest.approx(1 / 3 * 0.45 + 2 / 3 * 0.43)
 
 
+def test_ece_uses_exact_bucket_values_not_the_rounded_table():
+    records = [Record(0.9, True), Record(0.9, True), Record(0.9, False)]
+    assert ece(records) == pytest.approx(abs(2 / 3 - 0.9))
+
+
 def test_brier_is_the_mean_squared_error_against_a_right_answer():
     assert brier([Record(0.8, True), Record(0.6, False)]) == pytest.approx((0.04 + 0.36) / 2)
 
