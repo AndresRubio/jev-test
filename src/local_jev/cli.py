@@ -18,6 +18,7 @@ import httpx2
 
 from local_jev import __version__, launchd
 from local_jev.config import ENV_VARS, PATH_ENV_VARS, ConfigError, Settings, load_settings
+from local_jev.training import export_training
 
 NOT_RUNNING = (
     "local-jev is not running; start it with `local-jev serve` or `local-jev install-agent`"
@@ -99,6 +100,13 @@ def build_parser() -> argparse.ArgumentParser:
     uninstall = sub.add_parser("uninstall-agent", help="stop starting local-jev at login")
     uninstall.add_argument("--yes", action="store_true")
     uninstall.set_defaults(handler=cmd_uninstall_agent)
+
+    export = sub.add_parser(
+        "export-training",
+        help="turn the decision log into training rows (state, questions, gold) as JSONL",
+    )
+    export.add_argument("--out", type=Path, help="write the rows here instead of stdout")
+    export.set_defaults(handler=cmd_export_training)
     return parser
 
 
@@ -261,6 +269,26 @@ def cmd_uninstall_agent(args: argparse.Namespace) -> int:
         return 1
     removed = launchd.uninstall()
     print("removed the login agent" if removed else "no login agent was installed")
+    return 0
+
+
+def cmd_export_training(args: argparse.Namespace, settings: Settings) -> int:
+    export = export_training(settings.log_dir)
+    text = "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in export.rows)
+    count = len(export.rows)
+    summary = f"wrote {count} row{'' if count == 1 else 's'}"
+    if args.out:
+        args.out.write_text(text, encoding="utf-8")
+        summary += f" to {args.out}"
+    else:
+        sys.stdout.write(text)
+    if export.without_inputs:
+        skipped = export.without_inputs
+        summary += (
+            f"; skipped {skipped} decision{'' if skipped == 1 else 's'} logged without inputs"
+            " (log_inputs = false)"
+        )
+    print(summary, file=sys.stderr)
     return 0
 
 

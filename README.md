@@ -102,6 +102,26 @@ Laya is a small encoder (322M to 421M parameters), and it has limits:
 
 Verified with Claude Code on 2026-10-20: a new headless session (`claude -p`) listed `decide`, `decide_batch` and `status` over MCP and called each one. `decide` sent the double-billing message to billing (0.9566), and `decide_batch` read a 200-line JSONL file of synthetic support messages, returned the five billing matches it was asked for and wrote its results file. It gave 150 of the 200 messages the department they were written for: all 50 billing, all 50 technical, 40 of 50 sales and 10 of 50 other.
 
+## Train on your own decisions
+
+Laya is weak at nuanced judgement until it is fine-tuned on decisions like yours. [Unsloth's guide](https://unsloth.ai/docs/basics/train-your-own-decision-model-with-unsloth) trains a decision model from rows of `state`, `questions` and `gold`, the format Laya and Clef train on, and serves the result over the same `/v1/systemone` API that local-jev speaks. Its table reports Laya fine-tuned on the typed-decisions dataset at 77% after 10 minutes on 2.5 GB of GPU memory, and Qwen, Gemma and Llama turned into decision models in 30 to 50 minutes.
+
+1. Set `log_inputs = true` and let your agents use local-jev for a while. The decision log then keeps every state and every question.
+2. Run `local-jev export-training --out decisions.jsonl`. It reads the log and its rotated copies, oldest first, and writes one row per decision. `gold` holds the model's own answers, so correct the rows before you train on them, or the model learns its own mistakes. A `confidence` field per question points at the answers the model was least sure of. A yes/no gold is true when P(yes) was at least one half, and a score gold is the expected level rounded to the nearest level, because the log keeps the answer values and not the probabilities. Without `--out` the rows go to stdout.
+3. Train with Unsloth, in its Desktop app with "Train as" set to "Decision model", in its notebooks, or with the code in the guide. The Mac app can run Laya on the CPU or the GPU. Unsloth's guide says a model you trained with code and serve yourself needs a GPU, and it does not say whether a Mac's GPU counts, so check the current guide before you plan on training locally.
+4. Serve the trained model with Unsloth (`UNSLOTH_SYSTEMONE_MODEL=/path/to/model unsloth studio -p 8888`, then turn on the Decision API in Settings → API) and point local-jev at it:
+
+```toml
+backend = "remote"
+
+[remote]
+url = "http://127.0.0.1:8888/v1/systemone"
+```
+
+With keyless localhost access off in Unsloth, set `remote.api_key_env` to the variable that holds its `sk-unsloth-...` key. Unsloth answers `jev-latest`, which is what local-jev sends for `model = "auto"`, with your model, and the `local` block of every answer then reports `backend: "remote"`.
+
+The laya-mlx backend loads only the pinned Laya checkpoints, so a model trained elsewhere always runs behind the remote backend.
+
 ## Configuration
 
 `~/.config/local-jev/config.toml`, where every key is optional:
@@ -111,7 +131,7 @@ port = 7711
 backend = "laya-mlx"            # or "remote": any Jev-compatible /v1/systemone URL
 idle_unload_minutes = 15        # 0 = never unload
 noul_mode = "ab_labels"         # or "native": the model's default true/false labels
-log_inputs = false              # true also logs the inputs, for training later
+log_inputs = false              # true also logs the inputs, for export-training
 
 [laya]
 dtype = "float16"

@@ -1223,3 +1223,56 @@ def test_python_dash_m_runs_the_cli_and_exits_with_its_status(monkeypatch, argv,
     with pytest.raises(SystemExit) as info:
         runpy.run_module("local_jev", run_name="__main__")
     assert info.value.code == status
+
+
+def logged_decision(state):
+    return {
+        "ts": "2026-11-24T10:00:00.000+00:00",
+        "interface": "mcp",
+        "kind": "decide",
+        "latency_ms": 5.0,
+        "questions": [{"id": "refund", "type": "noul"}],
+        "model": "english",
+        "backend": "laya-mlx",
+        "checkpoint": "english",
+        "answers": {"refund": {"noul": 0.9, "answer_confidence": 0.9}},
+        "input_tokens": 10,
+        "warnings": [],
+        "state": state,
+        "question_definitions": json.loads(REFUND),
+    }
+
+
+def test_export_training_writes_the_rows_and_reports_the_counts(monkeypatch, tmp_path, capsys):
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    metadata_only = {k: v for k, v in logged_decision("x").items() if k != "state"}
+    del metadata_only["question_definitions"]
+    (logs / "decisions.jsonl").write_text(
+        json.dumps(logged_decision("Refund me")) + "\n" + json.dumps(metadata_only) + "\n"
+    )
+    out = tmp_path / "train.jsonl"
+    assert cli.main(["export-training", "--out", str(out)]) == 0
+    [row] = [json.loads(line) for line in out.read_text().splitlines()]
+    assert row["state"] == "Refund me"
+    assert row["gold"] == {"refund": True}
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == (
+        f"wrote 1 row to {out}; skipped 1 decision logged without inputs (log_inputs = false)\n"
+    )
+
+
+def test_export_training_prints_the_rows_without_out(monkeypatch, tmp_path, capsys):
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (logs / "decisions.jsonl").write_text(json.dumps(logged_decision("Refund me")) + "\n")
+    assert cli.main(["export-training"]) == 0
+    captured = capsys.readouterr()
+    assert json.loads(captured.out)["state"] == "Refund me"
+    assert captured.err == "wrote 1 row\n"
+
+
+def test_export_training_with_nothing_to_export_says_so(tmp_path, capsys):
+    assert cli.main(["export-training"]) == 0
+    assert capsys.readouterr().err == "wrote 0 rows\n"
