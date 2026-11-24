@@ -89,7 +89,7 @@ In the evaluation the model answered 22 of the 30 yes/no questions correctly wit
 Laya is a small encoder (322M to 421M parameters), and it has limits:
 
 - It is good at simple classification and yes/no reading, and weak at nuanced judgement unless it is fine-tuned on your own decisions.
-- Its probabilities are over-confident. Use them to rank answers, and remember that confidence is not permission.
+- Its probabilities are over-confident, and the calibration section of the evaluation shows where. Among the 60 native answers, the 26 with a confidence of 0.9 or more were right 85% of the time against a mean confidence of 0.9630. The expected calibration error (ECE) is 0.1528 for native and 0.1076 for the ab_labels default. Use the probabilities to rank answers, and remember that confidence is not permission.
 - The English checkpoint keeps about 320 to 480 tokens of the state, depending on how long the question and its options are, and the multilingual one about 760 to 990. An answer carries a `state_truncated` warning when the state was cut.
 - Negations in the text ("don't cancel") are a weak spot. Every negation item in the evaluation has its negation in the text, and the model got only 5 of those 10 right with true/false labels and 8 of 10 with A/B labels; some misses in both modes had a P(yes) above 0.9.
 - Phrase questions positively; the tool descriptions ask agents to do the same.

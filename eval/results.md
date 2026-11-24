@@ -1,4 +1,4 @@
-# Evaluation (2026-10-20)
+# Evaluation (2026-11-24)
 
 60 hand-labelled items (`eval/items.jsonl`), 12 of them in Spanish, one question per request.
 
@@ -27,6 +27,36 @@
 | noul · negations | 8/10 | 80% |
 
 The default `noul_mode` is `ab_labels`, the mode with more correct yes/no answers: native 22/30, ab_labels 24/30. A tie goes to `native`.
+
+## Calibration
+
+Confidence is the probability of the answer the model gave: max(P(yes), 1 - P(yes)) for a yes/no item, and the probability of the chosen label or level otherwise. Each row of a table is a bucket of confidence; the gap is the accuracy in the bucket minus its mean confidence. ECE, the expected calibration error, is the sum over buckets of the bucket's share of the items times the absolute gap. Brier is the mean squared error of the confidence against a right answer, 1 or 0.
+
+### noul_mode = native (60 items)
+
+| Confidence | Items | Mean confidence | Accuracy | Gap |
+|---|---|---|---|---|
+| 0.3 to 0.4 | 1 | 0.3767 | 0% | -0.3767 |
+| 0.4 to 0.5 | 4 | 0.4434 | 100% | +0.5566 |
+| 0.5 to 0.6 | 8 | 0.5592 | 50% | -0.0592 |
+| 0.6 to 0.7 | 7 | 0.6517 | 57% | -0.0803 |
+| 0.7 to 0.8 | 4 | 0.7660 | 100% | +0.2340 |
+| 0.8 to 0.9 | 10 | 0.8558 | 70% | -0.1558 |
+| 0.9 to 1.0 | 26 | 0.9630 | 85% | -0.1168 |
+
+ECE 0.1528, Brier 0.1895.
+
+### noul_mode = ab_labels (30 items)
+
+| Confidence | Items | Mean confidence | Accuracy | Gap |
+|---|---|---|---|---|
+| 0.5 to 0.6 | 5 | 0.5364 | 40% | -0.1364 |
+| 0.6 to 0.7 | 5 | 0.6649 | 80% | +0.1351 |
+| 0.7 to 0.8 | 3 | 0.7313 | 100% | +0.2687 |
+| 0.8 to 0.9 | 9 | 0.8494 | 89% | +0.0395 |
+| 0.9 to 1.0 | 8 | 0.9636 | 88% | -0.0886 |
+
+ECE 0.1076, Brier 0.1345.
 
 ## Misses
 
