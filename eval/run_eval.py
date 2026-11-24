@@ -17,7 +17,14 @@ import httpx2
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 from _server import temporary_server, wait_until_ready  # noqa: E402
 
-from local_jev.calibration import Record, brier, ece, reliability  # noqa: E402
+from local_jev.calibration import (  # noqa: E402
+    Record,
+    accuracy,
+    brier,
+    ece,
+    mean_confidence,
+    reliability,
+)
 
 ITEMS = Path(__file__).with_name("items.jsonl")
 RESULTS = Path(__file__).with_name("results.md")
@@ -99,14 +106,23 @@ CALIBRATION_DEFINITIONS = (
     "Confidence is the probability of the answer the model gave: max(P(yes), 1 - P(yes)) for a "
     "yes/no item, and the probability of the chosen label or level otherwise. Each row of a table "
     "is a bucket of confidence; the gap is the accuracy in the bucket minus its mean confidence. "
+    "A bucket includes its lower edge, and the last one also includes 1.0. "
     "ECE, the expected calibration error, is the sum over buckets of the bucket's share of the "
-    "items times the absolute gap. Brier is the mean squared error of the confidence against a "
-    "right answer, 1 or 0."
+    "items times the absolute gap. Brier is the mean squared error of the confidence against the "
+    "outcome, 1 for a right answer and 0 for a wrong one. A bucket can hold only a handful of "
+    "items, so read the gaps as rough."
 )
 
 
+def edge(value: float) -> str:
+    """A bucket edge with the decimals it needs and at least one: 0.9, 1.0, 0.75."""
+    text = f"{value:.4f}".rstrip("0")
+    return text + "0" if text.endswith(".") else text
+
+
 def calibration_section(records: dict[str, list[Record]]) -> list[str]:
-    """The Calibration section: the definitions, then a reliability table per mode."""
+    """The Calibration section: the definitions, then per mode a reliability table and a line
+    with the mean confidence, the accuracy, the ECE and the Brier score."""
     lines = ["", "## Calibration", "", CALIBRATION_DEFINITIONS, ""]
     for mode, mode_records in records.items():
         count = len(mode_records)
@@ -118,10 +134,15 @@ def calibration_section(records: dict[str, list[Record]]) -> list[str]:
         ]
         for bucket in reliability(mode_records):
             lines.append(
-                f"| {bucket.low:.1f} to {bucket.high:.1f} | {bucket.items} "
+                f"| {edge(bucket.low)} to {edge(bucket.high)} | {bucket.items} "
                 f"| {bucket.mean_confidence:.4f} | {bucket.accuracy:.0%} | {bucket.gap:+.4f} |"
             )
-        lines += ["", f"ECE {ece(mode_records):.4f}, Brier {brier(mode_records):.4f}.", ""]
+        summary = (
+            f"Mean confidence {mean_confidence(mode_records):.4f}, "
+            f"accuracy {accuracy(mode_records):.0%}, "
+            f"ECE {ece(mode_records):.4f}, Brier {brier(mode_records):.4f}."
+        )
+        lines += ["", summary, ""]
     return lines
 
 

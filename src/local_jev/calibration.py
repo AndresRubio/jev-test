@@ -1,4 +1,5 @@
-"""Calibration measures for the evaluation: a reliability table, ECE and the Brier score.
+"""Calibration measures for the evaluation: mean confidence, accuracy, a reliability table, ECE
+and the Brier score.
 
 Each record pairs the confidence of one answer with whether that answer was right. The
 confidence is the probability of the answer the model gave: max(P(yes), 1 - P(yes)) for a
@@ -34,18 +35,26 @@ class Bucket:
 
     @property
     def gap(self) -> float:
-        """Accuracy minus mean confidence: positive when the server is underconfident."""
+        """Accuracy minus mean confidence: positive when the server is under-confident."""
         return self.accuracy - self.mean_confidence
 
 
-def _require(records: Sequence[Record]) -> None:
+def _validate(records: Sequence[Record], width: float | None = None) -> None:
+    """Raise ValueError for no records, a confidence outside [0, 1] or a width that does not
+    split [0, 1] into whole buckets."""
+    if width is not None:
+        if not 0 < width <= 1 or abs(1 / width - round(1 / width)) > EDGE_TOLERANCE:
+            raise ValueError(f"width {width} must be in (0, 1] and divide 1 into whole buckets")
     if not records:
         raise ValueError("no records")
+    for record in records:
+        if not 0 <= record.confidence <= 1:
+            raise ValueError(f"confidence {record.confidence} is outside [0, 1]")
 
 
 def _buckets(records: Sequence[Record], width: float) -> list[Bucket]:
     """The non-empty buckets with exact, unrounded values."""
-    _require(records)
+    _validate(records, width)
     buckets = round(1 / width)
     grouped: dict[int, list[Record]] = {}
     for record in records:
@@ -56,11 +65,23 @@ def _buckets(records: Sequence[Record], width: float) -> list[Bucket]:
             low=index * width,
             high=index * width + width,
             items=len(members),
-            mean_confidence=sum(r.confidence for r in members) / len(members),
-            accuracy=sum(r.correct for r in members) / len(members),
+            mean_confidence=mean_confidence(members),
+            accuracy=accuracy(members),
         )
         for index, members in sorted(grouped.items())
     ]
+
+
+def mean_confidence(records: Sequence[Record]) -> float:
+    """The mean confidence of the records, unrounded."""
+    _validate(records)
+    return sum(r.confidence for r in records) / len(records)
+
+
+def accuracy(records: Sequence[Record]) -> float:
+    """The share of the records whose answer was right, unrounded."""
+    _validate(records)
+    return sum(r.correct for r in records) / len(records)
 
 
 def reliability(records: Sequence[Record], width: float = 0.1) -> list[Bucket]:
@@ -83,6 +104,6 @@ def ece(records: Sequence[Record], width: float = 0.1) -> float:
 
 
 def brier(records: Sequence[Record]) -> float:
-    """Mean squared distance between the confidence and the outcome (1 right, 0 wrong)."""
-    _require(records)
+    """The mean squared error of the confidence against the outcome, 1 if right and 0 if wrong."""
+    _validate(records)
     return sum((r.confidence - (1.0 if r.correct else 0.0)) ** 2 for r in records) / len(records)
