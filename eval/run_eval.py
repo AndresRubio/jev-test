@@ -1,4 +1,4 @@
-"""Accuracy on eval/items.jsonl for both yes/no label modes; writes eval/results.md.
+"""Accuracy and calibration on eval/items.jsonl for both yes/no label modes; writes eval/results.md.
 
 Run `uv run python eval/run_eval.py` after `local-jev pull`. It starts its own temporary server.
 """
@@ -16,6 +16,8 @@ import httpx2
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 from _server import temporary_server, wait_until_ready  # noqa: E402
+
+from local_jev.calibration import Record, brier, ece, reliability  # noqa: E402
 
 ITEMS = Path(__file__).with_name("items.jsonl")
 RESULTS = Path(__file__).with_name("results.md")
@@ -45,17 +47,20 @@ def predict(base: str, item: dict[str, Any], ab_labels: bool) -> tuple[Any, str,
 
 def evaluate(
     base: str, items: list[dict[str, Any]]
-) -> tuple[dict[str, dict[str, list[int]]], list[dict[str, Any]]]:
+) -> tuple[dict[str, dict[str, list[int]]], list[dict[str, Any]], dict[str, list[Record]]]:
     table: dict[str, dict[str, list[int]]] = {}
     misses: list[dict[str, Any]] = []
+    records: dict[str, list[Record]] = {}
     for mode in ("native", "ab_labels"):
         stats: dict[str, list[int]] = defaultdict(lambda: [0, 0])
+        records[mode] = []
         for item in items:
             kind = item["question"]["type"]
             if mode == "ab_labels" and kind != "noul":
                 continue
             guess, checkpoint, answer = predict(base, item, ab_labels=mode == "ab_labels")
             correct = int(guess == item["expected"])
+            records[mode].append(Record(answer["answer_confidence"], bool(correct)))
             if not correct:
                 misses.append({"mode": mode, "item": item, "guess": guess, "answer": answer})
             keys = [kind, f"{kind} · {checkpoint}"] + (
@@ -65,7 +70,7 @@ def evaluate(
                 stats[key][0] += correct
                 stats[key][1] += 1
         table[mode] = dict(stats)
-    return table, misses
+    return table, misses, records
 
 
 def shown(item: dict[str, Any], value: Any) -> str:
@@ -90,7 +95,41 @@ def cell(value: Any) -> str:
     return str(value).replace("|", "\\|")
 
 
-def render(table: dict[str, dict[str, list[int]]], misses: list[dict[str, Any]]) -> tuple[str, str]:
+CALIBRATION_DEFINITIONS = (
+    "Confidence is the probability of the answer the model gave: max(P(yes), 1 - P(yes)) for a "
+    "yes/no item, and the probability of the chosen label or level otherwise. Each row of a table "
+    "is a bucket of confidence; the gap is the accuracy in the bucket minus its mean confidence. "
+    "ECE, the expected calibration error, is the sum over buckets of the bucket's share of the "
+    "items times the absolute gap. Brier is the mean squared error of the confidence against a "
+    "right answer, 1 or 0."
+)
+
+
+def calibration_section(records: dict[str, list[Record]]) -> list[str]:
+    """The Calibration section: the definitions, then a reliability table per mode."""
+    lines = ["", "## Calibration", "", CALIBRATION_DEFINITIONS, ""]
+    for mode, mode_records in records.items():
+        count = len(mode_records)
+        lines += [
+            f"### noul_mode = {mode} ({count} {'item' if count == 1 else 'items'})",
+            "",
+            "| Confidence | Items | Mean confidence | Accuracy | Gap |",
+            "|---|---|---|---|---|",
+        ]
+        for bucket in reliability(mode_records):
+            lines.append(
+                f"| {bucket.low:.1f} to {bucket.high:.1f} | {bucket.items} "
+                f"| {bucket.mean_confidence:.4f} | {bucket.accuracy:.0%} | {bucket.gap:+.4f} |"
+            )
+        lines += ["", f"ECE {ece(mode_records):.4f}, Brier {brier(mode_records):.4f}.", ""]
+    return lines
+
+
+def render(
+    table: dict[str, dict[str, list[int]]],
+    misses: list[dict[str, Any]],
+    records: dict[str, list[Record]],
+) -> tuple[str, str]:
     native, ab = table["native"]["noul"], table["ab_labels"]["noul"]
     winner = "ab_labels" if ab[0] > native[0] else "native"
     lines = [
@@ -109,8 +148,8 @@ def render(table: dict[str, dict[str, list[int]]], misses: list[dict[str, Any]])
         f"The default `noul_mode` is `{winner}`, the mode with more correct yes/no answers: "
         f"native {native[0]}/{native[1]}, ab_labels {ab[0]}/{ab[1]}. A tie goes to `native`."
     )
+    lines += calibration_section(records)
     lines += [
-        "",
         "## Misses",
         "",
         "Probability is P(yes) for a yes/no item, and the probability of the given answer for a "
@@ -141,8 +180,8 @@ def main() -> int:
     ]
     with temporary_server() as (base, _process):
         wait_until_ready(base)
-        table, misses = evaluate(base, items)
-    text, winner = render(table, misses)
+        table, misses, records = evaluate(base, items)
+    text, winner = render(table, misses, records)
     RESULTS.write_text(text, encoding="utf-8")
     print(text)
     print(f"winner: {winner}")
