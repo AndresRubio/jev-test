@@ -62,7 +62,7 @@ The plan's "Recorded deviations" section lists every place where the code depart
 
 The README's "What to expect" section has the details.
 
-- Probabilities are over-confident. They rank answers well enough, but a high probability alone should not trigger an action.
+- In the native mode the 60 answers have a mean confidence of 0.80 against an accuracy of 75%, and the 26 with a confidence of 0.9 or more were right 85% of the time against a mean confidence of 96%; the expected calibration error is 0.1528. In ab_labels, the default, which covers only the 30 yes/no items, the mean confidence of 0.79 sits slightly under the accuracy of 80% and the expected calibration error is 0.1076, with only a handful of answers in most buckets. The probabilities rank answers well enough, but a high probability alone should not trigger an action.
 - English choices with 11 to 20 options are uncalibrated. The checkpoint ships a temperature of 0.1006 for that size, and laya-mlx raises it to 0.5.
 - The English checkpoint reads about 320 to 480 tokens of the input and the multilingual one about 760 to 990. Longer input is cut, and the answer carries a `state_truncated` warning.
 - Negations in the text, pricing questions and catch-all options are weak spots.

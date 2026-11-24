@@ -78,7 +78,7 @@ Differences from Jev:
 
 ## What to expect
 
-[docs/benchmarks.md](docs/benchmarks.md) has the speed and memory figures for this Mac, an M1 Pro with 16 GB, and [eval/results.md](eval/results.md) has the accuracy on 60 hand-labelled items in English and Spanish.
+[docs/benchmarks.md](docs/benchmarks.md) has the speed and memory figures for this Mac, an M1 Pro with 16 GB, and [eval/results.md](eval/results.md) has the accuracy and calibration on 60 hand-labelled items in English and Spanish.
 
 On that Mac one short question takes about 24 ms end to end over HTTP, and 10 questions in one call about 110 ms. The first request, which loads the English checkpoint, takes under a second. The process's footprint, as `top` reports it, is about 2,400 MB with both checkpoints loaded and under 300 MB after the idle unload.
 
@@ -89,7 +89,7 @@ In the evaluation the model answered 22 of the 30 yes/no questions correctly wit
 Laya is a small encoder (322M to 421M parameters), and it has limits:
 
 - It is good at simple classification and yes/no reading, and weak at nuanced judgement unless it is fine-tuned on your own decisions.
-- Its probabilities are over-confident. Use them to rank answers, and remember that confidence is not permission.
+- In the native mode its probabilities run high. The calibration section of [eval/results.md](eval/results.md) gives the 60 native answers a mean confidence of 0.80 against an accuracy of 75%, and the 26 answers with a confidence of 0.9 or more were right 85% of the time against a mean confidence of 96%. In ab_labels, the default, which covers only the 30 yes/no items, the mean confidence of 0.79 sits slightly under the accuracy of 80%. Most buckets of those tables hold only a handful of answers, so the gaps are rough. The expected calibration error (ECE) is 0.1528 for native and 0.1076 for ab_labels. Use the probabilities to rank answers, and remember that confidence is not permission.
 - The English checkpoint keeps about 320 to 480 tokens of the state, depending on how long the question and its options are, and the multilingual one about 760 to 990. An answer carries a `state_truncated` warning when the state was cut.
 - Negations in the text ("don't cancel") are a weak spot. Every negation item in the evaluation has its negation in the text, and the model got only 5 of those 10 right with true/false labels and 8 of 10 with A/B labels; some misses in both modes had a P(yes) above 0.9.
 - Phrase questions positively; the tool descriptions ask agents to do the same.
@@ -180,7 +180,7 @@ uv tool uninstall local-jev
 uv sync
 uv run pytest                    # unit tests: no network, no weights
 uv run pytest -m integration     # real weights (about 1.5 GB), downloaded on first run
-uv run python eval/run_eval.py   # accuracy; writes eval/results.md
+uv run python eval/run_eval.py   # accuracy and calibration; writes eval/results.md
 uv run python scripts/bench.py   # speed and memory; writes docs/benchmarks.md
 ```
 
