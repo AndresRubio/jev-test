@@ -8,9 +8,11 @@ import pytest
 
 from local_jev import batch
 from local_jev.batch import (
+    Band,
     Filter,
     aggregate_warnings,
     cleanup_results,
+    in_band,
     load_items,
     parse_batch_params,
     passes,
@@ -44,6 +46,7 @@ def words(text):
 def test_defaults():
     p = params()
     assert (p.format, p.chunk_tokens, p.top_k, p.model, p.filter) == ("auto", 256, 20, "auto", None)
+    assert p.uncertain is None
 
 
 @pytest.mark.parametrize(
@@ -102,6 +105,74 @@ def test_defaults():
             422,
             "op '=='",
         ),
+        (
+            {
+                "questions": {"relevant": NOUL},
+                "items": ["a"],
+                "uncertain": {"question": "other", "max_confidence": 0.9},
+            },
+            422,
+            "not one of the questions",
+        ),
+        (
+            {
+                "questions": {"relevant": NOUL},
+                "items": ["a"],
+                "uncertain": {"question": "relevant"},
+            },
+            422,
+            "max_confidence",
+        ),
+        (
+            {
+                "questions": {"relevant": NOUL},
+                "items": ["a"],
+                "uncertain": {"question": "relevant", "max_confidence": "high"},
+            },
+            422,
+            "from 0 to 1",
+        ),
+        (
+            {
+                "questions": {"relevant": NOUL},
+                "items": ["a"],
+                "uncertain": {"question": "relevant", "max_confidence": True},
+            },
+            422,
+            "from 0 to 1",
+        ),
+        (
+            {
+                "questions": {"relevant": NOUL},
+                "items": ["a"],
+                "uncertain": {"question": "relevant", "max_confidence": 1.5},
+            },
+            422,
+            "from 0 to 1",
+        ),
+        (
+            {
+                "questions": {"relevant": NOUL},
+                "items": ["a"],
+                "uncertain": {"question": "relevant", "max_confidence": 0.6, "min_confidence": 0.7},
+            },
+            422,
+            "min_confidence must not exceed max_confidence",
+        ),
+        (
+            {
+                "questions": {"relevant": NOUL},
+                "items": ["a"],
+                "uncertain": {"question": "relevant", "max_confidence": 0.9, "op": ">="},
+            },
+            422,
+            "keys question, max_confidence and min_confidence",
+        ),
+        (
+            {"questions": {"relevant": NOUL}, "items": ["a"], "uncertain": ["relevant", 0.9]},
+            422,
+            "keys question, max_confidence and min_confidence",
+        ),
     ],
 )
 def test_invalid_parameters(body, status, fragment):
@@ -114,6 +185,25 @@ def test_invalid_parameters(body, status, fragment):
 def test_a_choice_filter_is_parsed():
     p = params(questions={"dept": CHOICE}, filter={"question": "dept", "op": "==", "value": "tech"})
     assert p.filter == Filter("dept", "==", "tech")
+
+
+def test_an_uncertain_band_is_parsed_and_min_confidence_defaults_to_zero():
+    p = params(uncertain={"question": "relevant", "max_confidence": 0.9})
+    assert p.uncertain == Band("relevant", 0.0, 0.9)
+    p = params(
+        questions={"dept": CHOICE},
+        uncertain={"question": "dept", "min_confidence": 0.3, "max_confidence": 0.9},
+    )
+    assert p.uncertain == Band("dept", 0.3, 0.9)
+
+
+def test_an_uncertain_band_goes_with_a_filter():
+    p = params(
+        filter={"question": "relevant", "op": ">=", "value": 0.5},
+        uncertain={"question": "relevant", "max_confidence": 0.9},
+    )
+    assert p.filter == Filter("relevant", ">=", 0.5)
+    assert p.uncertain == Band("relevant", 0.0, 0.9)
 
 
 @pytest.mark.parametrize("question", [[], {}, ["relevant"], {"relevant": 1}, 1, None], ids=repr)
@@ -291,11 +381,49 @@ def test_passes():
 
 def test_select_matches_sorts_by_confidence_and_keeps_order_without_a_filter():
     records = [record(1, noul=0.6), record(2, noul=0.95), record(3, noul=0.2), record(4, noul=0.8)]
-    assert [m["id"] for m in select_matches(records, Filter("relevant", ">=", 0.5), top_k=2)] == [
+    assert [m["id"] for m in select_matches(records, Filter("relevant", ">=", 0.5), None)] == [
         2,
         4,
+        1,
     ]
-    assert [m["id"] for m in select_matches(records, None, top_k=3)] == [1, 2, 3]
+    assert [m["id"] for m in select_matches(records, None, None)] == [1, 2, 3, 4]
+
+
+def test_in_band_compares_the_answer_confidence_inclusively():
+    answers = record(1, noul=0.3)["answers"]  # answer_confidence 0.7 on relevant, 0.8 on dept
+    assert in_band(None, answers)
+    assert in_band(Band("relevant", 0.0, 0.9), answers)
+    assert in_band(Band("relevant", 0.7, 0.7), answers)
+    assert not in_band(Band("relevant", 0.0, 0.6), answers)
+    assert not in_band(Band("relevant", 0.75, 1.0), answers)
+    assert in_band(Band("dept", 0.0, 0.8), answers)
+    assert not in_band(Band("dept", 0.0, 0.79), answers)
+
+
+def test_select_matches_keeps_the_band_least_confident_first():
+    # answer_confidence on relevant: 0.6, 0.95, 0.8, 0.55, 0.8
+    records = [
+        record(1, noul=0.6),
+        record(2, noul=0.95),
+        record(3, noul=0.2),
+        record(4, noul=0.45),
+        record(5, noul=0.8),
+    ]
+    band = Band("relevant", 0.0, 0.9)
+    assert [m["id"] for m in select_matches(records, None, band)] == [4, 1, 3, 5]
+
+
+def test_select_matches_applies_the_filter_and_the_band_together():
+    records = [
+        record(1, noul=0.6),
+        record(2, noul=0.95),
+        record(3, noul=0.2),
+        record(4, noul=0.45),
+        record(5, noul=0.8),
+    ]
+    flt = Filter("relevant", ">=", 0.5)  # the yes side: 1, 2, 5
+    band = Band("relevant", 0.0, 0.9)  # drops 2
+    assert [m["id"] for m in select_matches(records, flt, band)] == [1, 5]
 
 
 def test_summarize():

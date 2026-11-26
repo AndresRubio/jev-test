@@ -231,14 +231,14 @@ def test_batch_sends_an_absolute_path_and_the_filter(monkeypatch, tmp_path):
     monkeypatch.setattr(cli, "_request", fake_request)
     monkeypatch.chdir(tmp_path)
     filter_json = '{"question": "q", "op": ">=", "value": 0.5}'
-    assert (
-        cli.main(
-            ["batch", "--questions-file", "q.json", "--path", "items.txt", "--filter", filter_json]
-        )
-        == 0
-    )
+    band_json = '{"question": "q", "max_confidence": 0.9}'
+    argv = ["batch", "--questions-file", "q.json", "--path", "items.txt", "--filter", filter_json]
+    assert cli.main(argv) == 0
     assert seen["payload"]["path"] == str(data.resolve())
     assert seen["payload"]["filter"] == {"question": "q", "op": ">=", "value": 0.5}
+    assert "uncertain" not in seen["payload"]
+    assert cli.main([*argv, "--uncertain", band_json]) == 0
+    assert seen["payload"]["uncertain"] == {"question": "q", "max_confidence": 0.9}
 
 
 def test_status_when_nothing_is_running(monkeypatch, capsys):

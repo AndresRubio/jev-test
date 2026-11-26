@@ -35,6 +35,7 @@ MAX_BATCH_QUESTIONS = 8
 SNIPPET_CHARS = 200
 RESULT_MAX_AGE_SECONDS = 7 * 24 * 3600
 FILTER_EXAMPLE = '{"question": "relevant", "op": ">=", "value": 0.8}'
+BAND_EXAMPLE = '{"question": "relevant", "max_confidence": 0.9, "min_confidence": 0.5}'
 READ_HINT = "check the path and its permissions"
 JSONL_HINT = "each line must hold one JSON value"
 READ_CHUNK_BYTES = 1 << 20
@@ -48,6 +49,15 @@ class Filter:
 
 
 @dataclass(frozen=True)
+class Band:
+    """The items whose answer_confidence for a question lies between low and high, inclusive."""
+
+    question: str
+    low: float
+    high: float
+
+
+@dataclass(frozen=True)
 class BatchParams:
     questions: dict[str, dict[str, Any]]
     items: list[Any] | None
@@ -56,6 +66,7 @@ class BatchParams:
     field: str | None
     chunk_tokens: int
     filter: Filter | None
+    uncertain: Band | None
     top_k: int
     model: str
 
@@ -106,6 +117,7 @@ def parse_batch_params(body: Any, *, max_items: int) -> BatchParams:
         field=field,
         chunk_tokens=_int_in_range(body.get("chunk_tokens", 256), "chunk_tokens", 32, 1024),
         filter=_parse_filter(body.get("filter"), questions),
+        uncertain=_parse_band(body.get("uncertain"), questions),
         top_k=_int_in_range(body.get("top_k", 20), "top_k", 1, 200),
         model=parse_model(body.get("model")),
     )
@@ -140,6 +152,34 @@ def _parse_filter(raw: Any, questions: dict[str, dict[str, Any]]) -> Filter | No
             "noul compares P(true), score the expected level",
         )
     return Filter(question=qid, op=op, value=value)
+
+
+def _parse_band(raw: Any, questions: dict[str, dict[str, Any]]) -> Band | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict) or not {"question", "max_confidence"} <= set(raw) <= {
+        "question",
+        "max_confidence",
+        "min_confidence",
+    }:
+        raise invalid(
+            "'uncertain' must have the keys question, max_confidence and min_confidence (optional)",
+            BAND_EXAMPLE,
+        )
+    qid = raw["question"]
+    if not isinstance(qid, str) or qid not in questions:
+        raise invalid(f"uncertain question {qid!r} is not one of the questions", BAND_EXAMPLE)
+    high = _probability(raw["max_confidence"], "max_confidence")
+    low = _probability(raw.get("min_confidence", 0.0), "min_confidence")
+    if low > high:
+        raise invalid("min_confidence must not exceed max_confidence", BAND_EXAMPLE)
+    return Band(question=qid, low=low, high=high)
+
+
+def _probability(value: Any, name: str) -> float:
+    if not isinstance(value, (int, float)) or isinstance(value, bool) or not 0 <= value <= 1:
+        raise invalid(f"'{name}' must be a number from 0 to 1", f"got {value!r}")
+    return float(value)
 
 
 def resolve_format(fmt: str, path: Path) -> str:
@@ -395,15 +435,34 @@ def passes(flt: Filter | None, answers: dict[str, dict[str, Any]]) -> bool:
     return value == flt.value
 
 
+def in_band(band: Band | None, answers: dict[str, dict[str, Any]]) -> bool:
+    if band is None:
+        return True
+    return band.low <= answers[band.question]["answer_confidence"] <= band.high
+
+
 def select_matches(
-    records: list[dict[str, Any]], flt: Filter | None, top_k: int
+    records: list[dict[str, Any]], flt: Filter | None, band: Band | None
 ) -> list[dict[str, Any]]:
-    matching = [record for record in records if passes(flt, record["answers"])]
-    if flt is not None:
+    """The records that pass the filter and lie in the band, in the order the caller shows them.
+
+    With a band, least confident first on the band's question, so the caller can re-judge the items
+    the model was least sure about. With only a filter, most confident first on its question. With
+    neither, input order. Python's sort is stable, so ties keep input order. The caller caps the
+    list, so it can report how many matched before the cap.
+    """
+    matching = [
+        record
+        for record in records
+        if passes(flt, record["answers"]) and in_band(band, record["answers"])
+    ]
+    if band is not None:
+        matching.sort(key=lambda record: record["answers"][band.question]["answer_confidence"])
+    elif flt is not None:
         matching.sort(
             key=lambda record: record["answers"][flt.question]["answer_confidence"], reverse=True
         )
-    return matching[:top_k]
+    return matching
 
 
 def summarize(

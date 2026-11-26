@@ -97,6 +97,16 @@ async def test_decide_batch_says_how_matches_are_ordered(service):
 
 
 @pytest.mark.anyio
+async def test_decide_batch_offers_the_uncertain_items_for_the_agent_to_judge(service):
+    text = (await listed(service))["decide_batch"].lower()
+    assert "uncertain" in text
+    assert "max_confidence" in text
+    assert "least confident first" in text
+    assert "judge" in text
+    assert "matched" in text
+
+
+@pytest.mark.anyio
 async def test_decide_batch_applies_the_token_window_to_each_item_and_chunk(service):
     text = (await listed(service))["decide_batch"].lower()
     assert "each item is read like a decide state" in text
@@ -182,6 +192,7 @@ async def test_decide_batch_hands_every_parameter_to_the_service():
         "field": "body.text",
         "chunk_tokens": 128,
         "filter": {"question": "dept", "op": "==", "value": "tech"},
+        "uncertain": {"question": "dept", "max_confidence": 0.9},
         "top_k": 5,
         "model": "english",
     }

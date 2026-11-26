@@ -58,7 +58,8 @@ This prints `claude mcp add --transport http --scope user local-jev http://127.0
 The MCP server has three tools:
 
 - `decide(state, questions, model="auto")` answers questions about one state, in Jev's request format.
-- `decide_batch(questions, path=None, items=None, format="auto", field=None, chunk_tokens=256, filter=None, top_k=20, model="auto")` asks the same questions, at most 8, about many items. The items come from a local file at an absolute `path` (`jsonl`, `csv`, `lines`, or `chunks` of a long text) or from an inline `items` list. It returns a summary per question, up to `top_k` matches and the path of a file with every item's answers, so the items never enter the agent's context. With a `filter`, the matches are the items that pass it, most confident first; without one, they are the first `top_k` items.
+- `decide_batch(questions, path=None, items=None, format="auto", field=None, chunk_tokens=256, filter=None, uncertain=None, top_k=20, model="auto")` asks the same questions, at most 8, about many items. The items come from a local file at an absolute `path` (`jsonl`, `csv`, `lines`, or `chunks` of a long text) or from an inline `items` list. It returns a summary per question, up to `top_k` matches, `matched` (how many items qualified before the `top_k` cap) and the path of a file with every item's answers, so the items never enter the agent's context. With a `filter`, the matches are the items that pass it, most confident first; without one, they are the first `top_k` items.
+- `uncertain` is for the answers that matter. `{"question": "relevant", "max_confidence": 0.9}` makes the matches the items whose `answer_confidence` for that question lies in the band (`min_confidence` defaults to 0), least confident first, so the agent re-judges only those and trusts the rest. The model answers every item in milliseconds and the agent reads only the band, the pattern Hightouch described for Jev plus a strong model in [LLM Judges for Identity Resolution at 4x Lower Cost](https://hightouch.com/blog/llm-judges-identity-resolution). It combines with `filter`, and the summary and the results file still cover every item. For a yes/no question `answer_confidence` is max(P(true), 1 - P(true)), so a `max_confidence` of 0.9 keeps the items with P(true) between 0.1 and 0.9. The design is in [docs/superpowers/specs/2026-11-27-batch-uncertain-band-design.md](docs/superpowers/specs/2026-11-27-batch-uncertain-band-design.md).
 - `status()` reports what the server is doing and never loads a model.
 
 Agents that only run shell commands can use the CLI: `local-jev decide --state "..." --questions-file q.json` and `local-jev batch --questions-file q.json --path items.jsonl`. Both send the request to the running server and print its JSON answer.
@@ -74,7 +75,7 @@ Differences from Jev:
 - `model` is optional: `auto`, `english`, `multilingual` or `typed-decisions`. `jev-latest` means `auto`.
 - Errors are `{"error": {"code", "message", "hint"}}`.
 
-`POST /v1/batch` takes the same parameters as `decide_batch`, and `local-jev batch` calls it. `GET /v1/status` returns what `status()` returns, and `GET /health` answers `{"ok": true}` without loading a model.
+`POST /v1/batch` takes the same parameters as `decide_batch`, `uncertain` included, and `local-jev batch` calls it (`--filter` and `--uncertain` take the same JSON objects). `GET /v1/status` returns what `status()` returns, and `GET /health` answers `{"ok": true}` without loading a model.
 
 ## What to expect
 

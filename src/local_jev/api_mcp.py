@@ -52,7 +52,9 @@ Give exactly one of:
 - path: absolute path to a local file. format: "jsonl" (one JSON object per line; field = dotted path to the text), "csv" (field = column), "lines" (one item per non-empty line), "chunks" (a long text split into pieces of about chunk_tokens tokens, with line ranges) or "auto" (by file extension).
 - items: a short inline list of states.
 
-filter (optional): {"question": id, "op": ">=" | "<=" | "==", "value": ...}. noul compares P(true), score compares the expected level, choice needs op "==" and one of its labels. matches holds up to top_k items. With a filter they are the items that pass it, most confident first (by the filter question's answer_confidence); without a filter they are the first top_k items in input order. summary counts answers per question; output_path is a JSONL file with every item's answers. On this Mac, expect about 47 short items per second with one question, about 30 with two questions and about 8 for items of about 430 tokens."""
+filter (optional): {"question": id, "op": ">=" | "<=" | "==", "value": ...}. noul compares P(true), score compares the expected level, choice needs op "==" and one of its labels. matches holds up to top_k items. With a filter they are the items that pass it, most confident first (by the filter question's answer_confidence); without a filter they are the first top_k items in input order. summary counts answers per question; output_path is a JSONL file with every item's answers. On this Mac, expect about 47 short items per second with one question, about 30 with two questions and about 8 for items of about 430 tokens.
+
+uncertain (optional): {"question": id, "max_confidence": 0.9, "min_confidence": 0.0}. Keeps the items whose answer_confidence for that question lies in the band, inclusive, and orders matches least confident first. Use it when the answers matter: the model answers every item cheaply here, then you judge the uncertain matches yourself and trust the rest, which is far cheaper than reading every item. For a noul question answer_confidence is max(P(true), 1 - P(true)), so max_confidence 0.9 keeps the items with P(true) between 0.1 and 0.9. It combines with filter: an item must pass both. summary and count still cover every item, and matched says how many items passed before the top_k cap, so raise top_k or narrow the band when matched is larger than top_k."""
 
 BATCH_TAIL = (
     """
@@ -112,6 +114,7 @@ def build_mcp_server(service: Any) -> MCPServer:
         field: str | None = None,
         chunk_tokens: int = 256,
         filter: dict[str, Any] | None = None,
+        uncertain: dict[str, Any] | None = None,
         top_k: int = 20,
         model: str = "auto",
     ) -> dict[str, Any]:
@@ -122,7 +125,14 @@ def build_mcp_server(service: Any) -> MCPServer:
             "top_k": top_k,
             "model": model,
         }
-        for key, value in (("path", path), ("items", items), ("field", field), ("filter", filter)):
+        optional = (
+            ("path", path),
+            ("items", items),
+            ("field", field),
+            ("filter", filter),
+            ("uncertain", uncertain),
+        )
+        for key, value in optional:
             if value is not None:
                 body[key] = value
         return await _call(service.decide_batch(body, interface="mcp"))

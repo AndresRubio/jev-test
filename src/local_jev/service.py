@@ -219,11 +219,11 @@ class DecisionService:
                 records.append(self._record(item, self._finalize(result, params.questions, 0.0)))
         latency_ms = (self._clock() - start) * 1000
         output_path = write_results(self.settings.results_dir, records)
-        matches = [
-            public_record(record) for record in select_matches(records, params.filter, params.top_k)
-        ]
+        matching = select_matches(records, params.filter, params.uncertain)
+        matches = [public_record(record) for record in matching[: params.top_k]]
         out = {
             "count": len(records),
+            "matched": len(matching),
             "summary": summarize(records, params.questions),
             "matches": matches,
             "output_path": str(output_path),

@@ -145,12 +145,40 @@ async def test_batch_over_inline_items(settings):
     finally:
         await service.stop()
     assert out["count"] == 3
+    assert out["matched"] == 2
     assert out["summary"]["dept"] == {"type": "choice", "counts": {"billing": 1, "tech": 2}}
     assert out["summary"]["refund"]["yes"] == 2
     assert [match["id"] for match in out["matches"]] == [1, "x9"]
     lines = Path(out["output_path"]).read_text().splitlines()
     assert len(lines) == 3
     assert json.loads(lines[2])["id"] == "x9"
+
+
+@pytest.mark.anyio
+async def test_batch_hands_back_the_uncertain_items_and_counts_every_item(settings):
+    # The fake engine answers dept with a confidence of 0.8 and refund with 0.9 on every item.
+    service = make(settings)
+    body = {
+        "questions": Q,
+        "items": ["yes billing", "no tech", "yes tech", "no billing"],
+        "uncertain": {"question": "dept", "max_confidence": 0.85},
+        "top_k": 3,
+    }
+    try:
+        out = await service.decide_batch(body, interface="test")
+        tight = await service.decide_batch(
+            {**body, "uncertain": {"question": "refund", "max_confidence": 0.85}}, interface="test"
+        )
+    finally:
+        await service.stop()
+    assert out["count"] == 4
+    assert out["matched"] == 4
+    assert [match["id"] for match in out["matches"]] == [1, 2, 3]
+    assert out["summary"]["dept"] == {"type": "choice", "counts": {"billing": 2, "tech": 2}}
+    assert len(Path(out["output_path"]).read_text().splitlines()) == 4
+    assert tight["count"] == 4
+    assert tight["matched"] == 0
+    assert tight["matches"] == []
 
 
 @pytest.mark.anyio
