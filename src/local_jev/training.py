@@ -3,11 +3,12 @@ Unsloth train on.
 
 Gold holds the model's own answers, so a row is a draft to correct before training. The log keeps
 only each answer's value and confidence, so a score's gold is its expected level rounded to the
-nearest level, and a noul's gold is true when P(yes) is at least one half."""
+nearest level, halfway up, and a noul's gold is true when P(yes) is at least one half."""
 
 from __future__ import annotations
 
 import json
+import math
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -21,6 +22,7 @@ class TrainingExport:
     rows: list[dict[str, Any]] = field(default_factory=list)
     without_inputs: int = 0  # decisions logged while log_inputs was off
     ignored: int = 0  # batch records and decisions that failed
+    malformed: int = 0  # lines that are not JSON, such as one the server never finished writing
 
 
 def training_row(entry: dict[str, Any]) -> dict[str, Any] | None:
@@ -44,7 +46,8 @@ def _gold(kind: str, answer: dict[str, Any]) -> Any:
     if kind == "noul":
         return float(answer["noul"]) >= 0.5
     if kind == "score":
-        return round(float(answer["score"]))
+        # Not round(): it sends a half to the even level, so 0.5 would give 0 and 2.5 would give 2.
+        return math.floor(float(answer["score"]) + 0.5)
     return answer["choice"]
 
 
@@ -71,7 +74,11 @@ def export_training(log_dir: Path) -> TrainingExport:
             for line in lines:
                 if not line.strip():
                     continue
-                entry = json.loads(line)
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    export.malformed += 1
+                    continue
                 row = training_row(entry)
                 if row is not None:
                     export.rows.append(row)

@@ -295,6 +295,12 @@ def cmd_export_training(args: argparse.Namespace, settings: Settings) -> int:
             f"; skipped {skipped} decision{'' if skipped == 1 else 's'} logged without inputs"
             " (log_inputs = false)"
         )
+    if export.malformed:
+        malformed = export.malformed
+        summary += (
+            f"; skipped {malformed} line{'' if malformed == 1 else 's'}"
+            f" that {'is' if malformed == 1 else 'are'} not JSON"
+        )
     print(summary, file=sys.stderr)
     return 0
 

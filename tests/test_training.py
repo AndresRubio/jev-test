@@ -1,6 +1,9 @@
-"""The training export turns decisions.jsonl into rows in the format Laya, Clef and Unsloth train on."""
+"""The training export turns decisions.jsonl into rows in the format Laya, Clef and Unsloth
+train on."""
 
 import json
+
+import pytest
 
 from local_jev.training import export_training, training_row
 
@@ -89,4 +92,19 @@ def test_export_reads_the_rotated_files_oldest_first_and_counts_what_it_skips(tm
 
 def test_export_of_a_missing_log_is_empty(tmp_path):
     export = export_training(tmp_path / "nowhere")
-    assert (export.rows, export.without_inputs, export.ignored) == ([], 0, 0)
+    counts = (export.rows, export.without_inputs, export.ignored, export.malformed)
+    assert counts == ([], 0, 0, 0)
+
+
+@pytest.mark.parametrize(("expected_level", "gold"), [(0.5, 1), (1.5, 2), (2.5, 3)])
+def test_a_score_halfway_between_two_levels_rounds_up(expected_level, gold):
+    answers = {**entry()["answers"], "urgency": {"score": expected_level, "answer_confidence": 0.5}}
+    assert training_row(entry(answers=answers))["gold"]["urgency"] == gold
+
+
+def test_export_skips_and_counts_a_line_that_is_not_json(tmp_path):
+    path = tmp_path / "decisions.jsonl"
+    path.write_text(json.dumps(entry(state="whole")) + '\n{"ts": "2026-11-24T10:', encoding="utf-8")
+    export = export_training(tmp_path)
+    assert [row["state"] for row in export.rows] == ["whole"]
+    assert export.malformed == 1

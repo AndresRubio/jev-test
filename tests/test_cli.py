@@ -1243,7 +1243,7 @@ def logged_decision(state):
     }
 
 
-def test_export_training_writes_the_rows_and_reports_the_counts(monkeypatch, tmp_path, capsys):
+def test_export_training_writes_the_rows_and_reports_the_counts(tmp_path, capsys):
     logs = tmp_path / "logs"
     logs.mkdir()
     metadata_only = {k: v for k, v in logged_decision("x").items() if k != "state"}
@@ -1263,7 +1263,7 @@ def test_export_training_writes_the_rows_and_reports_the_counts(monkeypatch, tmp
     )
 
 
-def test_export_training_prints_the_rows_without_out(monkeypatch, tmp_path, capsys):
+def test_export_training_prints_the_rows_without_out(tmp_path, capsys):
     logs = tmp_path / "logs"
     logs.mkdir()
     (logs / "decisions.jsonl").write_text(json.dumps(logged_decision("Refund me")) + "\n")
@@ -1276,3 +1276,15 @@ def test_export_training_prints_the_rows_without_out(monkeypatch, tmp_path, caps
 def test_export_training_with_nothing_to_export_says_so(tmp_path, capsys):
     assert cli.main(["export-training"]) == 0
     assert capsys.readouterr().err == "wrote 0 rows\n"
+
+
+def test_export_training_reports_the_lines_it_could_not_read(tmp_path, capsys):
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (logs / "decisions.jsonl").write_text(
+        json.dumps(logged_decision("Refund me")) + '\n{"ts": "2026-11-24T10:'
+    )
+    assert cli.main(["export-training"]) == 0
+    captured = capsys.readouterr()
+    assert json.loads(captured.out)["state"] == "Refund me"
+    assert captured.err == "wrote 1 row; skipped 1 line that is not JSON\n"
