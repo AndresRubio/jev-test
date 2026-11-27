@@ -77,6 +77,11 @@ def build_parser() -> argparse.ArgumentParser:
     batch.add_argument(
         "--filter", help='JSON, e.g. {"question": "relevant", "op": ">=", "value": 0.8}'
     )
+    batch.add_argument(
+        "--uncertain",
+        help='JSON, e.g. {"question": "relevant", "max_confidence": 0.9}: the items the model '
+        "is unsure about, least confident first",
+    )
     batch.add_argument("--top-k", type=int, default=20)
     batch.add_argument("--model", default="auto")
     batch.set_defaults(handler=cmd_batch)
@@ -175,6 +180,8 @@ def cmd_batch(args: argparse.Namespace, settings: Settings) -> int:
         payload["field"] = args.field
     if args.filter:
         payload["filter"] = json.loads(args.filter)
+    if args.uncertain:
+        payload["uncertain"] = json.loads(args.uncertain)
     return _call(
         settings, "POST", "/v1/batch", payload, timeout=settings.batch.timeout_seconds + 30
     )
