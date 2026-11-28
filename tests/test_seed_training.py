@@ -76,12 +76,12 @@ def test_a_score_item_gives_a_row_with_its_level_as_gold(seed_training):
 
 
 def test_the_evaluation_items_give_sixty_distinct_rows(seed_training):
-    rows = seed_training.seed_rows(seed_training.ITEMS)
+    rows = seed_training.rows_from_items(seed_training.ITEMS)
     assert len(rows) == 60
     keys = {(row["state"], json.dumps(row["questions"], sort_keys=True)) for row in rows}
     assert len(keys) == 60
 
 
 def test_the_committed_seed_file_is_what_the_script_generates(seed_training):
-    expected = seed_training.render(seed_training.seed_rows(seed_training.ITEMS))
+    expected = seed_training.render(seed_training.rows_from_items(seed_training.ITEMS))
     assert (EVAL / "seed-training.jsonl").read_text(encoding="utf-8") == expected

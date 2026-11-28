@@ -121,7 +121,7 @@ url = "http://127.0.0.1:8888/v1/systemone"
 
 With keyless localhost access off in Unsloth, set `remote.api_key_env` to the variable that holds its `sk-unsloth-...` key. Unsloth answers `jev-latest`, which is what local-jev sends for `model = "auto"`, with your model, and the `local` block of every answer then reports `backend: "remote"`.
 
-To train before you have a log of your own, `eval/seed-training.jsonl` holds the 60 hand-labelled items of the evaluation (30 yes/no, 20 choice and 10 score, 12 of them in Spanish) in the same format: one row per item, its question under the id `q`, and the right answer as `gold`. It has no `confidence` field, since no model answered these items. Train on it as it is, or append it to an export. `uv run python eval/seed_training.py` regenerates it from `eval/items.jsonl`, and a test fails when the committed file is out of date.
+To train before you have a log of your own, `eval/seed-training.jsonl` holds the 60 hand-labelled items of the evaluation in the same format: one row per item, its question under the id `q`, and the right answer as `gold`. It has no `confidence` field, since no model answered these items. Train on it as it is, or append it to an export. `uv run python eval/seed_training.py` regenerates it from `eval/items.jsonl`, and a test fails when the committed file is out of date.
 
 The laya-mlx backend loads only the pinned Laya checkpoints, so a model trained elsewhere always runs behind the remote backend.
 

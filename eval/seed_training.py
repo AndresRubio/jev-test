@@ -27,7 +27,7 @@ def seed_row(item: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def seed_rows(items_path: Path) -> list[dict[str, Any]]:
+def rows_from_items(items_path: Path) -> list[dict[str, Any]]:
     """One row per non-blank line of the items file, in file order."""
     lines = items_path.read_text(encoding="utf-8").splitlines()
     return [seed_row(json.loads(line)) for line in lines if line.strip()]
@@ -39,7 +39,7 @@ def render(rows: list[dict[str, Any]]) -> str:
 
 
 def main() -> int:
-    rows = seed_rows(ITEMS)
+    rows = rows_from_items(ITEMS)
     SEED.write_text(render(rows), encoding="utf-8")
     print(f"wrote {len(rows)} rows to {SEED}")
     return 0
